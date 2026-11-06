@@ -1,4 +1,6 @@
 {
+    "TaskDetectIntroCredits": "Detect intros and credits",
+    "TaskDetectIntroCreditsDescription": "Finds intros in series (comparing the audio of episodes in the same season) and credits in series and movies, and saves them as media segments so players can offer to skip them.",
     "AppDeviceValues": "App: {0}, Device: {1}",
     "Artists": "Artists",
     "AuthenticationSucceededWithUserName": "{0} successfully authenticated",

@@ -37,4 +37,11 @@ public interface IActivityManager
     /// <param name="startDate">Activity log start date.</param>
     /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
     Task CleanAsync(DateTime startDate);
+
+    /// <summary>
+    /// Removes a single activity log entry.
+    /// </summary>
+    /// <param name="id">The entry id.</param>
+    /// <returns><c>true</c> if the entry existed and was removed.</returns>
+    Task<bool> DeleteAsync(long id);
 }

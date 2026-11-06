@@ -89,4 +89,19 @@ public class ActivityLogController : BaseJellyfinApiController
 
         return await _activityManager.GetPagedResultAsync(query).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Deletes a single activity log entry (e.g. to dismiss an alert from the dashboard).
+    /// </summary>
+    /// <param name="id">The entry id.</param>
+    /// <response code="204">Entry deleted.</response>
+    /// <response code="404">Entry not found.</response>
+    /// <returns>A <see cref="NoContentResult"/>.</returns>
+    [HttpDelete("Entries/{id}")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> DeleteLogEntry([FromRoute] long id)
+    {
+        return await _activityManager.DeleteAsync(id).ConfigureAwait(false) ? NoContent() : NotFound();
+    }
 }

@@ -146,6 +146,20 @@ public class ActivityManager : IActivityManager
         }
     }
 
+    /// <inheritdoc />
+    public async Task<bool> DeleteAsync(long id)
+    {
+        var dbContext = await _provider.CreateDbContextAsync().ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            var deleted = await dbContext.ActivityLogs
+                .Where(entry => entry.Id == id)
+                .ExecuteDeleteAsync()
+                .ConfigureAwait(false);
+            return deleted > 0;
+        }
+    }
+
     private static ActivityLogEntry ConvertToOldModel(ActivityLog entry)
     {
         return new ActivityLogEntry(entry.Name, entry.Type, entry.UserId)

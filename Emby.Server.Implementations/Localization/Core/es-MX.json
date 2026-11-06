@@ -1,4 +1,6 @@
 {
+    "TaskDetectIntroCredits": "Detectar introducciones y créditos",
+    "TaskDetectIntroCreditsDescription": "Busca las introducciones de las series (comparando el audio de los episodios de una misma temporada) y los créditos de series y películas, y los guarda como segmentos para que los reproductores ofrezcan saltarlos.",
     "AppDeviceValues": "App: {0}, Dispositivo: {1}",
     "Artists": "Artistas",
     "AuthenticationSucceededWithUserName": "{0} autenticado con éxito",

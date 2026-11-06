@@ -29,6 +29,7 @@ using Emby.Server.Implementations.Library;
 using Emby.Server.Implementations.Library.Search;
 using Emby.Server.Implementations.Library.SimilarItems;
 using Emby.Server.Implementations.Localization;
+using Emby.Server.Implementations.MediaSegments;
 using Emby.Server.Implementations.Playlists;
 using Emby.Server.Implementations.Plugins;
 using Emby.Server.Implementations.QuickConnect;
@@ -635,6 +636,11 @@ namespace Emby.Server.Implementations
             serviceCollection.AddSingleton<IDirectoryService, DirectoryService>();
 
             serviceCollection.AddSingleton<IMediaSegmentManager, MediaSegmentManager>();
+            serviceCollection.AddSingleton<IntroCreditsStore>();
+            serviceCollection.AddSingleton<IntroCreditsAnalyzer>();
+            serviceCollection.AddSingleton<IntroCreditsDetector>();
+            serviceCollection.AddSingleton<IMediaSegmentProvider, IntroCreditsSegmentProvider>();
+            serviceCollection.AddSingleton<IIntroCreditsService, IntroCreditsService>();
         }
 
         /// <summary>
