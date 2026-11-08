@@ -641,6 +641,9 @@ namespace Emby.Server.Implementations
             serviceCollection.AddSingleton<IntroCreditsDetector>();
             serviceCollection.AddSingleton<IMediaSegmentProvider, IntroCreditsSegmentProvider>();
             serviceCollection.AddSingleton<IIntroCreditsService, IntroCreditsService>();
+            serviceCollection.AddSingleton<IVobSubRepairService, Emby.Server.Implementations.MediaEncoding.VobSubRepairService>();
+            serviceCollection.AddSingleton<Emby.Server.Implementations.PlaybackStats.PlaybackStatsStore>();
+            serviceCollection.AddSingleton<MediaBrowser.Controller.PlaybackStats.IPlaybackStatsService>(sp => sp.GetRequiredService<Emby.Server.Implementations.PlaybackStats.PlaybackStatsStore>());
         }
 
         /// <summary>

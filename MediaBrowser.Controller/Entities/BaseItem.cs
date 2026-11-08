@@ -1319,12 +1319,23 @@ namespace MediaBrowser.Controller.Entities
             {
                 var displayName = System.IO.Path.GetFileNameWithoutExtension(path);
 
+                // Plex/Kometa style "{edition-Open Matte}" names the version directly.
+                var editionStart = displayName.IndexOf("{edition-", StringComparison.OrdinalIgnoreCase);
+                if (editionStart >= 0)
+                {
+                    var editionEnd = displayName.IndexOf('}', editionStart);
+                    if (editionEnd > editionStart + 9)
+                    {
+                        terms.Add(displayName.Substring(editionStart + 9, editionEnd - editionStart - 9).Trim());
+                    }
+                }
+
                 // Prefer the suffix that differs from the other versions: strip the prefix shared by
                 // all sibling files. This works regardless of folder layout, so it also labels episode
                 // versions that share a season folder (e.g. "Greyscale" instead of the full
                 // "Show - S01E02 - Title - Greyscale"). The prefix is already retreated to a delimiter
                 // boundary (see GetCommonVersionPrefix).
-                if (!string.IsNullOrEmpty(commonPrefix)
+                if (terms.Count == 0 && !string.IsNullOrEmpty(commonPrefix)
                     && displayName.Length > commonPrefix.Length
                     && displayName.StartsWith(commonPrefix, StringComparison.OrdinalIgnoreCase))
                 {
@@ -1393,6 +1404,20 @@ namespace MediaBrowser.Controller.Entities
                     {
                         terms.Add("ISO");
                     }
+                }
+            }
+
+            // Drop provider id tags ("{tmdb-123}", "[imdbid-tt1]") and dots from version labels.
+            for (var i = 0; i < terms.Count; i++)
+            {
+                var cleaned = System.Text.RegularExpressions.Regex.Replace(
+                    terms[i],
+                    @"\s*[\{\[](tmdb|imdb|tvdb|tmdbid|imdbid|tvdbid)[-=][^\}\]]*[\}\]]",
+                    string.Empty,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase).Replace('.', ' ').Trim();
+                if (cleaned.Length > 0)
+                {
+                    terms[i] = cleaned;
                 }
             }
 

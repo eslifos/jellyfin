@@ -423,6 +423,44 @@ namespace Jellyfin.Naming.Tests.Video
             Assert.Equal(2, result.Count);
         }
 
+        [Theory]
+        [InlineData("/movies/Selena (1997)/")]
+        [InlineData("/movies/")]
+        public void Resolve_GivenEditionTagWithProviderIds_GroupsVersions(string folder)
+        {
+            var files = new[]
+            {
+                folder + "Selena (1997) {tmdb-16052} {imdb-tt0120094} {edition-Open Matte}.mkv",
+                folder + "Selena (1997) {tmdb-16052} {imdb-tt0120094}.mkv",
+                folder + "Other Movie (2001) {tmdb-1}.mkv"
+            };
+
+            var result = _videoListResolver.Resolve(
+                files.Select(i => VideoResolver.Resolve(i, false, _namingOptions)).OfType<VideoFileInfo>().ToList()).ToList();
+
+            var selena = Assert.Single(result, r => System.IO.Path.GetFileName(r.Files[0].Path).StartsWith("Selena", StringComparison.Ordinal));
+            Assert.Equal(folder + "Selena (1997) {tmdb-16052} {imdb-tt0120094}.mkv", selena.Files[0].Path);
+            Assert.Single(selena.AlternateVersions);
+            Assert.Equal(2, result.Count);
+        }
+
+        [Fact]
+        public void Resolve_GivenDottedQualitySuffixes_GroupsVersions()
+        {
+            var files = new[]
+            {
+                "/movies/47 Ronin (2013).4K.Hevc {Tmdb-64686} {Imdb-Tt1335975}.mkv",
+                "/movies/47 Ronin (2013).1080P.H264 {Tmdb-64686} {Imdb-Tt1335975}.mkv"
+            };
+
+            var result = _videoListResolver.Resolve(
+                files.Select(i => VideoResolver.Resolve(i, false, _namingOptions)).OfType<VideoFileInfo>().ToList()).ToList();
+
+            var movie = Assert.Single(result);
+            Assert.Single(movie.AlternateVersions);
+            Assert.Equal("47 Ronin", movie.Name);
+        }
+
         [Fact]
         public void TestEmptyList()
         {

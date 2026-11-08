@@ -129,7 +129,7 @@ namespace Emby.Naming.Video
 
             if (folderName.Length <= 1 || !HaveSameYear(videos))
             {
-                return videos;
+                return GetVideosGroupedByTitleKey(videos);
             }
 
             // Cannot use Span inside local functions and delegates thus we cannot use LINQ here nor merge with the above [if]
@@ -144,7 +144,7 @@ namespace Emby.Naming.Video
 
                 if (!IsEligibleForMultiVersion(folderName, video.Files[0].FileNameWithoutExtension))
                 {
-                    return videos;
+                    return GetVideosGroupedByTitleKey(videos);
                 }
 
                 if (folderName.Equals(video.Files[0].FileNameWithoutExtension, StringComparison.Ordinal))
@@ -157,6 +157,104 @@ namespace Emby.Naming.Video
 
             return [organized];
         }
+
+        /// <summary>
+        /// Groups editions / versions that share "Title (Year)" and the same provider ids, e.g.
+        /// "Selena (1997) {tmdb-16052} {edition-Open Matte}.mkv" with "Selena (1997) {tmdb-16052}.mkv", or
+        /// "47 Ronin (2013).4K.Hevc {tmdb-64686}.mkv" with "47 Ronin (2013).1080P.H264 {tmdb-64686}.mkv".
+        /// Works in a movie's own folder and in flat folders with many movies.
+        /// </summary>
+        private static List<VideoInfo> GetVideosGroupedByTitleKey(List<VideoInfo> videos)
+        {
+            if (videos.Count < 2)
+            {
+                return videos;
+            }
+
+            var result = new List<VideoInfo>();
+            var groups = new Dictionary<string, List<VideoInfo>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var video in videos)
+            {
+                var key = video.ExtraType is null && video.Files.Count == 1 ? GetTitleKey(video.Files[0].FileNameWithoutExtension.ToString()) : null;
+                if (key is null)
+                {
+                    result.Add(video);
+                    continue;
+                }
+
+                if (!groups.TryGetValue(key, out var group))
+                {
+                    group = [];
+                    groups[key] = group;
+                }
+
+                group.Add(video);
+            }
+
+            foreach (var group in groups.Values)
+            {
+                if (group.Count == 1)
+                {
+                    result.Add(group[0]);
+                    continue;
+                }
+
+                // Primary: the plain file (no edition tag), else the highest resolution.
+                var primary = group.FirstOrDefault(v => !EditionTagRegex().IsMatch(v.Files[0].FileNameWithoutExtension.ToString()));
+                var name = TitleYearRegex().Match(group[0].Files[0].FileNameWithoutExtension.ToString()).Groups["title"].Value.Trim(' ', '.', '_', '-');
+                var organized = OrganizeAlternateVersions(group, primary);
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    organized.Name = name.Replace('.', ' ');
+                }
+
+                result.Add(organized);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// "title (year)|ids" or null when the name has no "(year)".
+        /// </summary>
+        private static string? GetTitleKey(string fileName)
+        {
+            var match = TitleYearRegex().Match(fileName);
+            if (!match.Success)
+            {
+                return null;
+            }
+
+            // Malformed suffixes (unclosed "[" or "{") are left alone.
+            var rest = fileName.AsSpan(match.Length);
+            if (rest.Count('[') != rest.Count(']') || rest.Count('{') != rest.Count('}'))
+            {
+                return null;
+            }
+
+            var title = NonAlphaNumericRegex().Replace(match.Groups["title"].Value, string.Empty).ToLowerInvariant();
+            if (title.Length == 0)
+            {
+                return null;
+            }
+
+            var ids = string.Join(
+                ',',
+                ProviderIdRegex().Matches(fileName).Select(m => m.Groups["provider"].Value.ToLowerInvariant() + m.Groups["id"].Value.ToLowerInvariant()).Order(StringComparer.Ordinal));
+            return title + "|" + match.Groups["year"].Value + "|" + ids;
+        }
+
+        [GeneratedRegex(@"^(?<title>.+?)[ ._]*\((?<year>(19|20)[0-9]{2})\)")]
+        private static partial Regex TitleYearRegex();
+
+        [GeneratedRegex(@"[\{\[](?<provider>tmdb|imdb|tvdb|tmdbid|imdbid|tvdbid)[-=](?<id>[a-z0-9]+)[\}\]]", RegexOptions.IgnoreCase)]
+        private static partial Regex ProviderIdRegex();
+
+        [GeneratedRegex(@"\{edition-[^}]+\}", RegexOptions.IgnoreCase)]
+        private static partial Regex EditionTagRegex();
+
+        [GeneratedRegex(@"[^\p{L}\p{N}]")]
+        private static partial Regex NonAlphaNumericRegex();
 
         private static bool HaveSameYear(IReadOnlyList<VideoInfo> videos)
         {
