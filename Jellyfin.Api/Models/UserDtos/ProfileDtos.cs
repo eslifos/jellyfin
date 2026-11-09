@@ -4,6 +4,17 @@ using System.Collections.Generic;
 namespace Jellyfin.Api.Models.UserDtos;
 
 /// <summary>
+/// Body of a profile switch.
+/// </summary>
+public record SwitchProfileDto
+{
+    /// <summary>
+    /// Gets the password of the account (master user). Required when switching away from a secondary profile.
+    /// </summary>
+    public string? Password { get; init; }
+}
+
+/// <summary>
 /// A viewing profile of an account (the master user itself or one of its linked profile users).
 /// </summary>
 public record ProfileDto

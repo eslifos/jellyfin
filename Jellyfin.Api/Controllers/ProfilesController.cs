@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.IO;
 using System.Linq;
+using System.Security;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
@@ -18,6 +19,7 @@ using MediaBrowser.Controller.Session;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Api.Controllers;
@@ -250,13 +252,18 @@ public class ProfilesController : BaseJellyfinApiController
     /// Switches the current session to another profile of the same account.
     /// </summary>
     /// <param name="profileId">The profile user id to switch to.</param>
+    /// <param name="request">The account password, needed when switching away from a secondary profile.</param>
     /// <response code="200">New session created for the profile.</response>
-    /// <response code="403">The profile does not belong to the current account.</response>
+    /// <response code="403">The profile does not belong to the current account, or the password is wrong.</response>
+    /// <response code="428">The account password is required.</response>
     /// <returns>An <see cref="AuthenticationResult"/> for the profile.</returns>
     [HttpPost("{profileId}/Switch")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
-    public async Task<ActionResult<AuthenticationResult>> SwitchProfile([FromRoute, Required] Guid profileId)
+    [ProducesResponseType(StatusCodes.Status428PreconditionRequired)]
+    public async Task<ActionResult<AuthenticationResult>> SwitchProfile(
+        [FromRoute, Required] Guid profileId,
+        [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] SwitchProfileDto? request)
     {
         var currentId = User.GetUserId();
         var links = await ReadLinksAsync().ConfigureAwait(false);
@@ -272,6 +279,39 @@ public class ProfilesController : BaseJellyfinApiController
         if (target is null)
         {
             return NotFound();
+        }
+
+        // Only the account itself switches freely. A secondary profile (which may have parental limits)
+        // must not reach the account, which may be an administrator, or a sibling without its password.
+        if (!currentId.Equals(masterId))
+        {
+            var master = _userManager.GetUserById(masterId);
+            if (master is null)
+            {
+                return Forbid();
+            }
+
+            if (!string.IsNullOrEmpty(master.Password))
+            {
+                if (string.IsNullOrEmpty(request?.Password))
+                {
+                    return StatusCode(StatusCodes.Status428PreconditionRequired);
+                }
+
+                try
+                {
+                    var verified = await _userManager.AuthenticateUser(master.Username, request.Password, HttpContext.GetNormalizedRemoteIP().ToString(), false).ConfigureAwait(false);
+                    if (verified is null)
+                    {
+                        return Forbid();
+                    }
+                }
+                catch (Exception ex) when (ex is AuthenticationException or SecurityException)
+                {
+                    _logger.LogWarning("Wrong account password when switching profile from {User}", User.GetUserId());
+                    return Forbid();
+                }
+            }
         }
 
         return await _sessionManager.AuthenticateDirect(new AuthenticationRequest

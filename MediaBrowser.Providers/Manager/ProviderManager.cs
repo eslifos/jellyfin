@@ -68,6 +68,7 @@ namespace MediaBrowser.Providers.Manager
         private readonly IMemoryCache _memoryCache;
         private readonly IMediaSegmentManager _mediaSegmentManager;
         private readonly ISimilarItemsManager _similarItemsManager;
+        private readonly IMetadataSourcePreferences? _sourcePreferences;
         private readonly AsyncKeyedLocker<string> _imageSaveLock = new(o =>
         {
             o.PoolSize = 20;
@@ -107,6 +108,7 @@ namespace MediaBrowser.Providers.Manager
         /// <param name="memoryCache">The memory cache.</param>
         /// <param name="mediaSegmentManager">The media segment manager.</param>
         /// <param name="similarItemsManager">The similar items manager.</param>
+        /// <param name="sourcePreferences">The per-series main metadata source.</param>
         public ProviderManager(
             IHttpClientFactory httpClientFactory,
             ISubtitleManager subtitleManager,
@@ -120,8 +122,10 @@ namespace MediaBrowser.Providers.Manager
             ILyricManager lyricManager,
             IMemoryCache memoryCache,
             IMediaSegmentManager mediaSegmentManager,
-            ISimilarItemsManager similarItemsManager)
+            ISimilarItemsManager similarItemsManager,
+            IMetadataSourcePreferences? sourcePreferences = null)
         {
+            _sourcePreferences = sourcePreferences;
             _logger = logger;
             _httpClientFactory = httpClientFactory;
             _configurationManager = configurationManager;
@@ -499,6 +503,19 @@ namespace MediaBrowser.Providers.Manager
             where T : BaseItem
         {
             var typeOptions = libraryOptions.GetTypeOptions(item.GetType().Name);
+
+            // A series (and its seasons / episodes) can have its own main source: it is asked first and
+            // every other source, even one disabled in the library, fills what it left empty.
+            var primarySource = includeDisabled ? null : _sourcePreferences?.GetPrimarySource(item);
+            if (!string.IsNullOrEmpty(primarySource))
+            {
+                var allProviders = GetOrCreateOrderedProviders<T>(item.GetType().Name, libraryOptions, globalMetadataOptions, true, forceEnableInternetMetadata, libraryPath);
+                return allProviders
+                    .Where(i => CanRefreshMetadata(i, item, typeOptions, false, forceEnableInternetMetadata)
+                        || (i is IRemoteMetadataProvider && !item.IsLocked && !item.ExtraType.HasValue))
+                    .OrderBy(i => i is IRemoteMetadataProvider && string.Equals(i.Name, primarySource, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    .ToArray();
+            }
 
             var orderedProviders = GetOrCreateOrderedProviders<T>(item.GetType().Name, libraryOptions, globalMetadataOptions, includeDisabled, forceEnableInternetMetadata, libraryPath);
 

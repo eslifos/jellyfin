@@ -115,6 +115,12 @@ public class CustomLogoController : BaseJellyfinApiController
             return BadRequest("Unsupported image type. Use PNG, JPEG, WebP or GIF.");
         }
 
+        // Base64 is 4/3 of the image size
+        if (Request.ContentLength is long length && length > (MaxImageBytes * 4L / 3) + 4096)
+        {
+            return BadRequest("The image is empty or larger than 10 MB.");
+        }
+
         byte[] bytes;
         using (var base64 = new CryptoStream(Request.Body, new FromBase64Transform(), CryptoStreamMode.Read))
         using (var memory = new MemoryStream())

@@ -61,6 +61,7 @@ public partial class ItemBadgesController : BaseJellyfinApiController
     private readonly ILibraryManager _libraryManager;
     private readonly IMediaSourceManager _mediaSourceManager;
     private readonly IUserManager _userManager;
+    private readonly MediaBrowser.Controller.Imdb.IImdbRatingsService _imdb;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ItemBadgesController"/> class.
@@ -68,11 +69,13 @@ public partial class ItemBadgesController : BaseJellyfinApiController
     /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
     /// <param name="mediaSourceManager">Instance of the <see cref="IMediaSourceManager"/> interface.</param>
     /// <param name="userManager">Instance of the <see cref="IUserManager"/> interface.</param>
-    public ItemBadgesController(ILibraryManager libraryManager, IMediaSourceManager mediaSourceManager, IUserManager userManager)
+    /// <param name="imdb">The IMDb ratings.</param>
+    public ItemBadgesController(ILibraryManager libraryManager, IMediaSourceManager mediaSourceManager, IUserManager userManager, MediaBrowser.Controller.Imdb.IImdbRatingsService imdb)
     {
         _libraryManager = libraryManager;
         _mediaSourceManager = mediaSourceManager;
         _userManager = userManager;
+        _imdb = imdb;
     }
 
     /// <summary>
@@ -90,7 +93,7 @@ public partial class ItemBadgesController : BaseJellyfinApiController
         foreach (var id in (ids ?? Array.Empty<Guid>()).Distinct().Take(MaxIds))
         {
             var item = _libraryManager.GetItemById(id);
-            if (item is null || (user is not null && !item.IsVisible(user)))
+            if (item is null || user is null || !item.IsVisibleStandalone(user))
             {
                 continue;
             }
@@ -135,6 +138,14 @@ public partial class ItemBadgesController : BaseJellyfinApiController
             CriticRating = item.CriticRating,
             ImdbId = item.GetProviderId(MediaBrowser.Model.Entities.MetadataProvider.Imdb)
         };
+
+        var imdb = _imdb.GetRating(item);
+        if (imdb is not null)
+        {
+            badges.ImdbId = imdb.ImdbId;
+            badges.ImdbRating = imdb.Rating;
+            badges.ImdbVotes = imdb.Votes;
+        }
 
         // Network: own studios, or the series' studios for seasons/episodes.
         var studioSource = item switch

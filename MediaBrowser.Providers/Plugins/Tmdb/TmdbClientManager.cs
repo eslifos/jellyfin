@@ -170,6 +170,29 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
         }
 
         /// <summary>
+        /// Gets the alternative episode orders (episode groups) TMDb has for a tv show, with their content.
+        /// </summary>
+        /// <param name="tvShowId">The tv show's TMDb id.</param>
+        /// <param name="language">The language.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The Jellyfin display order value with its group (only the first group of each type).</returns>
+        public async Task<IReadOnlyList<(string DisplayOrder, TvGroupCollection Group)>> GetSeriesEpisodeGroupsAsync(int tvShowId, string? language, CancellationToken cancellationToken)
+        {
+            var series = await GetSeriesAsync(tvShowId, language, null, null, cancellationToken).ConfigureAwait(false);
+            var result = new List<(string, TvGroupCollection)>();
+            foreach (var displayOrder in new[] { "originalAirDate", "absolute", "dvd", "digital", "storyArc", "production", "tv" })
+            {
+                var group = await GetSeriesGroupAsync(tvShowId, displayOrder, language, null, null, cancellationToken).ConfigureAwait(false);
+                if (group is not null)
+                {
+                    result.Add((displayOrder, group));
+                }
+            }
+
+            return series is null ? [] : result;
+        }
+
+        /// <summary>
         /// Gets a tv show episode group from the TMDb API based on the show id and the display order.
         /// </summary>
         /// <param name="tvShowId">The tv show's TMDb id.</param>

@@ -64,6 +64,16 @@ public class ItemBadges
     public string? ImdbId { get; set; }
 
     /// <summary>
+    /// Gets or sets the IMDb rating (official IMDb datasets).
+    /// </summary>
+    public float? ImdbRating { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of IMDb votes.
+    /// </summary>
+    public int? ImdbVotes { get; set; }
+
+    /// <summary>
     /// Gets or sets "S01E01" for episodes.
     /// </summary>
     public string? EpisodeCode { get; set; }
