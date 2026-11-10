@@ -18,6 +18,7 @@ using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Drawing;
 using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Extensions;
 using MediaBrowser.Model.IO;
 using MediaBrowser.Model.MediaInfo;
 using MediaBrowser.Model.Net;
@@ -159,18 +160,64 @@ namespace MediaBrowser.Providers.Manager
             // track library limits, adding buffer to allow lazy replacing of current images
             var backdropLimit = typeOptions.GetLimit(ImageType.Backdrop) + oldBackdropImages.Length;
             var downloadedImages = new List<ImageType>();
+            var providerList = providers.ToList();
 
-            foreach (var provider in providers)
+            // Ask every remote provider first, so a poster in the library language from a later provider
+            // wins over an English one from the first provider.
+            var prefetched = new Dictionary<IRemoteImageProvider, List<RemoteImageInfo>>();
+            var bestScores = new Dictionary<ImageType, int>();
+            var remoteProviders = providerList.OfType<IRemoteImageProvider>().ToList();
+            if (remoteProviders.Count > 1 && item.SupportsRemoteImageDownloading)
+            {
+                var language = item.GetPreferredMetadataLanguage();
+                var country = item.GetPreferredMetadataCountryCode();
+                var original = GetOriginalLanguage(item);
+                foreach (var remoteProvider in remoteProviders)
+                {
+                    if (!NeedsProvider(item, remoteProvider, refreshOptions, typeOptions, backdropLimit))
+                    {
+                        continue;
+                    }
+
+                    var list = await GetRemoteImages(item, remoteProvider, cancellationToken).ConfigureAwait(false);
+                    prefetched[remoteProvider] = list;
+                    foreach (var image in list)
+                    {
+                        if (!_singularImages.Contains(image.Type)
+                            || (image.Width.HasValue && image.Width.Value < typeOptions.GetMinWidth(image.Type)))
+                        {
+                            continue;
+                        }
+
+                        var score = EnumerableExtensions.GetLanguageScore(image.Language, language, country, original);
+                        if (!bestScores.TryGetValue(image.Type, out var best) || score > best)
+                        {
+                            bestScores[image.Type] = score;
+                        }
+                    }
+                }
+            }
+
+            foreach (var provider in providerList)
             {
                 if (provider is IRemoteImageProvider remoteProvider)
                 {
-                    await RefreshFromProvider(item, remoteProvider, refreshOptions, typeOptions, backdropLimit, downloadedImages, result, cancellationToken).ConfigureAwait(false);
+                    await RefreshFromProvider(item, remoteProvider, refreshOptions, typeOptions, backdropLimit, downloadedImages, result, prefetched.GetValueOrDefault(remoteProvider), bestScores, false, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
                 if (provider is IDynamicImageProvider dynamicImageProvider)
                 {
                     await RefreshFromProvider(item, dynamicImageProvider, refreshOptions, typeOptions, downloadedImages, result, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            // The best images could not be downloaded (bad urls): take whatever the providers have
+            if (bestScores.Count > 0)
+            {
+                foreach (var remoteProvider in remoteProviders)
+                {
+                    await RefreshFromProvider(item, remoteProvider, refreshOptions, typeOptions, backdropLimit, downloadedImages, result, prefetched.GetValueOrDefault(remoteProvider), null, true, cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -270,6 +317,9 @@ namespace MediaBrowser.Providers.Manager
         /// <param name="backdropLimit">The backdrop limit.</param>
         /// <param name="downloadedImages">The downloaded images.</param>
         /// <param name="result">The result.</param>
+        /// <param name="prefetched">The images of this provider, if already fetched.</param>
+        /// <param name="bestScores">The best language score any provider has per image type; images below it are skipped.</param>
+        /// <param name="singularOnly">Whether to only download the single images (fallback pass).</param>
         /// <param name="cancellationToken">The cancellation token.</param>
         /// <returns>Task.</returns>
         private async Task RefreshFromProvider(
@@ -280,34 +330,21 @@ namespace MediaBrowser.Providers.Manager
             int backdropLimit,
             List<ImageType> downloadedImages,
             RefreshResult result,
+            List<RemoteImageInfo> prefetched,
+            Dictionary<ImageType, int> bestScores,
+            bool singularOnly,
             CancellationToken cancellationToken)
         {
             try
             {
-                if (!item.SupportsRemoteImageDownloading)
-                {
-                    return;
-                }
-
-                if (!refreshOptions.ReplaceAllImages &&
-                    refreshOptions.ReplaceImages.Count == 0 &&
-                    ContainsImages(item, provider.GetSupportedImages(item).ToList(), savedOptions, backdropLimit))
+                if (!NeedsProvider(item, provider, refreshOptions, savedOptions, backdropLimit))
                 {
                     return;
                 }
 
                 _logger.LogDebug("Running {Provider} for {Item}", provider.GetType().Name, item.Path ?? item.Name);
 
-                var images = await _providerManager.GetAvailableRemoteImages(
-                    item,
-                    new RemoteImageQuery(provider.Name)
-                    {
-                        IncludeAllLanguages = true,
-                        IncludeDisabledProviders = false,
-                    },
-                    cancellationToken).ConfigureAwait(false);
-
-                var list = images.ToList();
+                var list = prefetched ?? await GetRemoteImages(item, provider, cancellationToken).ConfigureAwait(false);
                 int minWidth;
 
                 foreach (var imageType in _singularImages)
@@ -320,13 +357,28 @@ namespace MediaBrowser.Providers.Manager
                     if (!item.HasImage(imageType) || (refreshOptions.IsReplacingImage(imageType) && !downloadedImages.Contains(imageType)))
                     {
                         minWidth = savedOptions.GetMinWidth(imageType);
-                        var downloaded = await DownloadImage(item, provider, result, list, minWidth, imageType, cancellationToken).ConfigureAwait(false);
+                        var candidates = list;
+                        if (bestScores is not null && bestScores.TryGetValue(imageType, out var best))
+                        {
+                            // Another provider has this image in a better language: leave it to that one
+                            var language = item.GetPreferredMetadataLanguage();
+                            var country = item.GetPreferredMetadataCountryCode();
+                            var original = GetOriginalLanguage(item);
+                            candidates = list.Where(i => i.Type != imageType || EnumerableExtensions.GetLanguageScore(i.Language, language, country, original) >= best).ToList();
+                        }
+
+                        var downloaded = await DownloadImage(item, provider, result, candidates, minWidth, imageType, cancellationToken).ConfigureAwait(false);
 
                         if (downloaded)
                         {
                             downloadedImages.Add(imageType);
                         }
                     }
+                }
+
+                if (singularOnly)
+                {
+                    return;
                 }
 
                 minWidth = savedOptions.GetMinWidth(ImageType.Backdrop);
@@ -343,6 +395,49 @@ namespace MediaBrowser.Providers.Manager
                 result.ErrorMessage = ex.Message;
                 _logger.LogError(ex, "Error in {Provider} for {Item}", provider.Name, item.Path ?? item.Name);
             }
+        }
+
+        /// <summary>
+        /// Gets the original language of an item; episodes and seasons use the one of their series.
+        /// </summary>
+        /// <param name="item">The item.</param>
+        /// <returns>The original language, or <c>null</c>.</returns>
+        internal static string GetOriginalLanguage(BaseItem item)
+        {
+            var series = item switch
+            {
+                Episode episode => episode.Series,
+                Season season => season.Series,
+                _ => null
+            };
+
+            return series?.OriginalLanguage ?? item.GetInheritedOriginalLanguage();
+        }
+
+        private bool NeedsProvider(BaseItem item, IRemoteImageProvider provider, ImageRefreshOptions refreshOptions, TypeOptions savedOptions, int backdropLimit)
+        {
+            if (!item.SupportsRemoteImageDownloading)
+            {
+                return false;
+            }
+
+            return refreshOptions.ReplaceAllImages
+                || refreshOptions.ReplaceImages.Count > 0
+                || !ContainsImages(item, provider.GetSupportedImages(item).ToList(), savedOptions, backdropLimit);
+        }
+
+        private async Task<List<RemoteImageInfo>> GetRemoteImages(BaseItem item, IRemoteImageProvider provider, CancellationToken cancellationToken)
+        {
+            var images = await _providerManager.GetAvailableRemoteImages(
+                item,
+                new RemoteImageQuery(provider.Name)
+                {
+                    IncludeAllLanguages = true,
+                    IncludeDisabledProviders = false,
+                },
+                cancellationToken).ConfigureAwait(false);
+
+            return images.ToList();
         }
 
         /// <summary>

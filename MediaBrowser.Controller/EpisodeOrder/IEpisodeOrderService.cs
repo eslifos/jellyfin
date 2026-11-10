@@ -20,6 +20,16 @@ public interface IEpisodeOrderService
     Task<EpisodeOrderAnalysis> AnalyzeAsync(Series series, bool refresh, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Saves the display order and main source, then refreshes the series and its episodes right away (in the background).
+    /// </summary>
+    /// <param name="series">The series.</param>
+    /// <param name="displayOrder">The display order ("" = aired).</param>
+    /// <param name="source">The main source, or <c>null</c> for the library order.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns><c>false</c> if the series is already being refreshed.</returns>
+    Task<bool> ApplyAsync(Series series, string displayOrder, string? source, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Reads again the season / episode numbers of the files that have none.
     /// </summary>
     /// <param name="series">The series.</param>

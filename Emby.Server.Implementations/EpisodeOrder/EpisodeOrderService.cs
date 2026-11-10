@@ -22,6 +22,7 @@ using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.EpisodeOrder;
+using MediaBrowser.Model.IO;
 using MediaBrowser.Model.Providers;
 using MediaBrowser.Providers.Plugins.Tmdb;
 using Microsoft.Extensions.Logging;
@@ -44,6 +45,8 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TmdbClientManager _tmdb;
     private readonly ILogger<EpisodeOrderService> _logger;
+    private readonly IFileSystem _fileSystem;
+    private readonly ConcurrentDictionary<Guid, RefreshJob> _jobs = new();
     private readonly SemaphoreSlim _loginLock = new(1, 1);
     private readonly ConcurrentDictionary<string, (DateTime Time, List<OrderData> Orders)> _cache = new();
     private string? _token;
@@ -58,14 +61,17 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
     /// <param name="httpClientFactory">The HTTP client factory.</param>
     /// <param name="tmdb">The TMDb client.</param>
     /// <param name="logger">The logger.</param>
+    /// <param name="fileSystem">The file system.</param>
     public EpisodeOrderService(
         ILibraryManager libraryManager,
         IProviderManager providerManager,
         IMetadataSourcePreferences sourcePreferences,
         IHttpClientFactory httpClientFactory,
         TmdbClientManager tmdb,
-        ILogger<EpisodeOrderService> logger)
+        ILogger<EpisodeOrderService> logger,
+        IFileSystem fileSystem)
     {
+        _fileSystem = fileSystem;
         _libraryManager = libraryManager;
         _providerManager = providerManager;
         _sourcePreferences = sourcePreferences;
@@ -135,7 +141,8 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
             SeasonCount = o.Slots.Keys.Select(k => k.Season).Distinct().Count(),
             EpisodeCount = o.Slots.Count,
             Matched = episodes.Count(e => e.ParentIndexNumber.HasValue && e.IndexNumber.HasValue && o.Slots.ContainsKey((e.ParentIndexNumber.Value, e.IndexNumber.Value))),
-            IsCurrent = ReferenceEquals(o, currentOrder)
+            IsCurrent = ReferenceEquals(o, currentOrder),
+            SeasonEpisodeCounts = o.Slots.Keys.GroupBy(k => k.Season).ToDictionary(g => g.Key, g => g.Count())
         }).ToList();
 
         return new EpisodeOrderAnalysis
@@ -147,14 +154,43 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
             Sources = sources,
             Orders = options,
             Notes = notes,
+            RefreshState = GetRefreshState(series.Id, out var refreshProgress),
+            RefreshProgress = refreshProgress,
             Episodes = episodes.Select(e =>
             {
                 var hasNumber = e.ParentIndexNumber.HasValue && e.IndexNumber.HasValue;
-                string? expected = null;
+                Slot? slot = null;
                 bool? inOrder = null;
                 if (currentOrder is not null && hasNumber)
                 {
-                    inOrder = currentOrder.Slots.TryGetValue((e.ParentIndexNumber!.Value, e.IndexNumber!.Value), out expected);
+                    inOrder = currentOrder.Slots.TryGetValue((e.ParentIndexNumber!.Value, e.IndexNumber!.Value), out slot);
+                }
+
+                // The file sits in a slot of the order, but its data belongs to another episode (old order / not refreshed yet)
+                var outdated = inOrder == true && !string.IsNullOrEmpty(slot?.Id)
+                    && !string.Equals(e.GetProviderId(currentOrder!.Provider == "Tvdb" ? MetadataProvider.Tvdb : MetadataProvider.Tmdb), slot!.Id, StringComparison.Ordinal);
+                var expected = slot?.Name;
+
+                // Where else this season / number exists (other providers or orders), for files the order in use does not have
+                var alsoIn = inOrder == false
+                    ? orders.Where(o => !ReferenceEquals(o, currentOrder) && o.Slots.ContainsKey((e.ParentIndexNumber!.Value, e.IndexNumber!.Value)))
+                        .Select(o => (o.Provider == "Tvdb" ? "TVDB" : "TMDb") + " · " + o.Name)
+                        .ToList()
+                    : [];
+                var dataFrom = new List<string>();
+                if (!string.IsNullOrEmpty(e.GetProviderId(MetadataProvider.Tvdb)))
+                {
+                    dataFrom.Add("TVDB");
+                }
+
+                if (!string.IsNullOrEmpty(e.GetProviderId(MetadataProvider.Tmdb)))
+                {
+                    dataFrom.Add("TMDb");
+                }
+
+                if (!string.IsNullOrEmpty(e.GetProviderId(MetadataProvider.Imdb)))
+                {
+                    dataFrom.Add("IMDb");
                 }
 
                 return new EpisodeOrderEpisode
@@ -167,10 +203,57 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
                     NumberEnd = e.IndexNumberEnd,
                     HasProviderData = HasProviderData(e),
                     InOrder = inOrder,
-                    ExpectedName = string.IsNullOrEmpty(expected) ? null : expected
+                    ExpectedName = string.IsNullOrEmpty(expected) ? null : expected,
+                    Outdated = outdated,
+                    AlsoIn = alsoIn,
+                    DataFrom = dataFrom
                 };
             }).ToList()
         };
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> ApplyAsync(Series series, string displayOrder, string? source, CancellationToken cancellationToken)
+    {
+        if (_jobs.TryGetValue(series.Id, out var running) && running.State == "Running")
+        {
+            return false;
+        }
+
+        series.DisplayOrder = displayOrder;
+        await series.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+        _sourcePreferences.SetPrimarySource(series.Id, source);
+
+        // Refreshed right away instead of through the refresh queue, which runs one item at a time
+        // and would wait for any library scan in progress.
+        var job = new RefreshJob { State = "Running", Started = DateTime.UtcNow };
+        _jobs[series.Id] = job;
+        var options = new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+        {
+            MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+            ImageRefreshMode = MetadataRefreshMode.Default,
+            ReplaceAllMetadata = true,
+            ReplaceAllImages = false,
+            ForceSave = true
+        };
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _providerManager.RefreshFullItem(series, options, CancellationToken.None).ConfigureAwait(false);
+                job.State = "Done";
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Refreshing {Series} after changing its episode order failed", series.Name);
+                job.State = "Failed";
+            }
+
+            job.Finished = DateTime.UtcNow;
+        }, CancellationToken.None);
+
+        return true;
     }
 
     /// <inheritdoc />
@@ -197,6 +280,30 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
     public void Dispose()
     {
         _loginLock.Dispose();
+    }
+
+    private string GetRefreshState(Guid seriesId, out double? progress)
+    {
+        progress = _providerManager.GetRefreshProgress(seriesId);
+        if (_jobs.TryGetValue(seriesId, out var job))
+        {
+            if (job.State == "Running")
+            {
+                return "Running";
+            }
+
+            if (job.Finished is DateTime finished && DateTime.UtcNow - finished < TimeSpan.FromMinutes(10))
+            {
+                return job.State;
+            }
+        }
+
+        if (progress.HasValue)
+        {
+            return "Running";
+        }
+
+        return _providerManager.GetRefreshQueue().Contains(seriesId) ? "Queued" : "Idle";
     }
 
     private static bool HasProviderData(BaseItem item)
@@ -290,7 +397,7 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
         var result = new List<OrderData>();
         foreach (var (type, names) in types)
         {
-            var slots = new Dictionary<(int Season, int Number), string?>();
+            var slots = new Dictionary<(int Season, int Number), Slot>();
             string? next = $"series/{tvdbId.ToString(CultureInfo.InvariantCulture)}/episodes/{Uri.EscapeDataString(type)}?page=0";
             for (var page = 0; next is not null && page < 20; page++)
             {
@@ -301,7 +408,7 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
                     {
                         if (Int(e, "seasonNumber") is int sn && Int(e, "number") is int n)
                         {
-                            slots.TryAdd((sn, n), Str(e, "name"));
+                            slots.TryAdd((sn, n), new Slot(Str(e, "name"), Int(e, "id")?.ToString(CultureInfo.InvariantCulture)));
                         }
                     }
                 }
@@ -412,12 +519,12 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
             return result;
         }
 
-        var aired = new Dictionary<(int Season, int Number), string?>();
+        var aired = new Dictionary<(int Season, int Number), Slot>();
         foreach (var season in show.Seasons ?? [])
         {
             for (var n = 1; n <= season.EpisodeCount; n++)
             {
-                aired.TryAdd((season.SeasonNumber, n), null);
+                aired.TryAdd((season.SeasonNumber, n), new Slot(null, null));
             }
         }
 
@@ -425,13 +532,13 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
 
         foreach (var (displayOrder, group) in await _tmdb.GetSeriesEpisodeGroupsAsync(tmdbId, language, cancellationToken).ConfigureAwait(false))
         {
-            var slots = new Dictionary<(int Season, int Number), string?>();
+            var slots = new Dictionary<(int Season, int Number), Slot>();
             foreach (var g in group.Groups ?? [])
             {
                 foreach (var e in g.Episodes ?? [])
                 {
                     // Episode order inside a group starts at 0
-                    slots.TryAdd((g.Order, (int)e.Order + 1), e.Name);
+                    slots.TryAdd((g.Order, (int)e.Order + 1), new Slot(e.Name, e.Id?.ToString(CultureInfo.InvariantCulture)));
                 }
             }
 
@@ -447,6 +554,17 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
     private static int? Int(JsonElement e, string name)
         => e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var i) ? i : null;
 
+    private sealed record Slot(string? Name, string? Id);
+
+    private sealed class RefreshJob
+    {
+        public string State { get; set; } = "Idle";
+
+        public DateTime Started { get; init; }
+
+        public DateTime? Finished { get; set; }
+    }
+
     private sealed class OrderData
     {
         public string Provider { get; init; } = string.Empty;
@@ -457,6 +575,6 @@ public sealed class EpisodeOrderService : IEpisodeOrderService, IDisposable
 
         public string? AlternateName { get; init; }
 
-        public Dictionary<(int Season, int Number), string?> Slots { get; init; } = [];
+        public Dictionary<(int Season, int Number), Slot> Slots { get; init; } = [];
     }
 }

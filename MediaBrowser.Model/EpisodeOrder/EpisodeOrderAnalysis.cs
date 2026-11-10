@@ -44,6 +44,16 @@ public class EpisodeOrderAnalysis
     public IReadOnlyList<EpisodeOrderEpisode> Episodes { get; set; } = [];
 
     /// <summary>
+    /// Gets or sets the refresh state of the series: "Idle", "Queued", "Running", "Done" or "Failed".
+    /// </summary>
+    public string RefreshState { get; set; } = "Idle";
+
+    /// <summary>
+    /// Gets or sets the refresh progress (0-100) while running, if known.
+    /// </summary>
+    public double? RefreshProgress { get; set; }
+
+    /// <summary>
     /// Gets or sets notes about providers that could not be checked (codes: "TvdbNoPlugin", "TvdbError", "TmdbError", "NoIds").
     /// </summary>
     public IReadOnlyList<string> Notes { get; set; } = [];
@@ -93,6 +103,11 @@ public class EpisodeOrderOption
     /// Gets or sets a value indicating whether it is the order in use.
     /// </summary>
     public bool IsCurrent { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of episodes of each season in this order.
+    /// </summary>
+    public IReadOnlyDictionary<int, int> SeasonEpisodeCounts { get; set; } = new Dictionary<int, int>();
 }
 
 /// <summary>
@@ -144,4 +159,19 @@ public class EpisodeOrderEpisode
     /// Gets or sets the provider's name for that season / number in the order in use.
     /// </summary>
     public string? ExpectedName { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether its data belongs to another episode (another order, or not refreshed yet).
+    /// </summary>
+    public bool Outdated { get; set; }
+
+    /// <summary>
+    /// Gets or sets the other orders that have this season / number (only for files the order in use does not have).
+    /// </summary>
+    public IReadOnlyList<string> AlsoIn { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the providers whose ids the episode has (where its data came from).
+    /// </summary>
+    public IReadOnlyList<string> DataFrom { get; set; } = [];
 }

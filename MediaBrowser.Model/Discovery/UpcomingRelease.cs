@@ -39,6 +39,16 @@ public class UpcomingRelease
     public string? ImageUrl { get; set; }
 
     /// <summary>
+    /// Gets or sets the backdrop URL.
+    /// </summary>
+    public string? BackdropUrl { get; set; }
+
+    /// <summary>
+    /// Gets or sets the TMDb rating (0-10).
+    /// </summary>
+    public double? Rating { get; set; }
+
+    /// <summary>
     /// Gets or sets the series of the library (episodes).
     /// </summary>
     public Guid? SeriesId { get; set; }

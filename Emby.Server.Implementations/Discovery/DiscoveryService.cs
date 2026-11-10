@@ -42,6 +42,8 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
 
     private (DateTime Built, List<HeroPick> Picks)? _hero;
     private (DateTime Built, List<UpcomingRelease> Releases)? _upcoming;
+    private readonly ConcurrentDictionary<string, (DateTime Built, LibraryDiscovery Rows)> _libraryRows = new(StringComparer.Ordinal);
+    private static readonly TimeSpan _libraryMaxAge = TimeSpan.FromMinutes(30);
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DiscoveryService"/> class.
@@ -137,6 +139,278 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
             .Where(r => r.ReleaseDate >= from && r.ReleaseDate <= to)
             .Where(r => IsVisible(r.Kind == "Episode" ? r.SeriesId : r.RelatedItemId))
             .ToList();
+    }
+
+    /// <inheritdoc />
+    public async Task<LibraryDiscovery> GetLibraryAsync(User user, Guid parentId, CancellationToken cancellationToken)
+    {
+        var key = user.Id.ToString("N", CultureInfo.InvariantCulture) + parentId.ToString("N", CultureInfo.InvariantCulture);
+        if (_libraryRows.TryGetValue(key, out var cached) && DateTime.UtcNow - cached.Built < _libraryMaxAge)
+        {
+            return cached.Rows;
+        }
+
+        if (_libraryManager.GetItemById(parentId) is not Folder library)
+        {
+            return new LibraryDiscovery();
+        }
+
+        var language = library.GetPreferredMetadataLanguage();
+        var country = library.GetPreferredMetadataCountryCode();
+        if (string.IsNullOrEmpty(country))
+        {
+            country = "US";
+        }
+
+        var movies = library.GetItemList(new InternalItemsQuery(user)
+        {
+            IncludeItemTypes = [BaseItemKind.Movie],
+            Recursive = true,
+            IsVirtualItem = false
+        })
+            // Only the main version of movies with several copies: the app does not list the other versions
+            .Where(m => m is not Video { PrimaryVersionId: not null })
+            .ToList();
+
+        var byTmdb = new Dictionary<int, BaseItem>();
+        foreach (var movie in movies)
+        {
+            if (TmdbId(movie) is int id)
+            {
+                byTmdb.TryAdd(id, movie);
+            }
+        }
+
+        async Task<IReadOnlyList<TMDbLib.Objects.Search.SearchMovie>> List(string name, int pages)
+        {
+            try
+            {
+                return await _tmdb.GetMovieListAsync(name, language, country, pages, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "TMDb list {List} not available", name);
+                return [];
+            }
+        }
+
+        var day = await List("trending-day", 5).ConfigureAwait(false);
+        var week = await List("trending-week", 5).ConfigureAwait(false);
+        var popular = await List("popular", 5).ConfigureAwait(false);
+        var upcoming = await List("upcoming", 3).ConfigureAwait(false);
+        var nowPlaying = await List("now-playing", 3).ConfigureAwait(false);
+
+        // Top 10: what people watch right now (trending this week and today, and popular), best ranked first
+        var heat = new Dictionary<Guid, double>();
+        void Heat(IReadOnlyList<TMDbLib.Objects.Search.SearchMovie> list, double weight)
+        {
+            for (var i = 0; i < list.Count; i++)
+            {
+                if (byTmdb.TryGetValue(list[i].Id, out var item))
+                {
+                    heat[item.Id] = heat.GetValueOrDefault(item.Id) + (weight * (list.Count - i) / list.Count);
+                }
+            }
+        }
+
+        Heat(week, 1.0);
+        Heat(day, 0.8);
+        Heat(popular, 0.5);
+
+        var ratings = movies.ToDictionary(m => m.Id, m => _imdb.GetRating(m));
+        double Weighted(BaseItem m, double minVotes)
+        {
+            var r = ratings.GetValueOrDefault(m.Id);
+            if (r is null || r.Votes <= 0)
+            {
+                return (m.CommunityRating ?? 0) * 0.5;
+            }
+
+            return (r.Votes / (r.Votes + minVotes) * r.Rating) + (minVotes / (r.Votes + minVotes) * 6.8);
+        }
+
+        var top10 = heat.OrderByDescending(h => h.Value).Select(h => h.Key).Take(10).ToList();
+        if (top10.Count < 10)
+        {
+            // Not enough trending titles: the most voted recent movies of the library
+            var recent = DateTime.UtcNow.AddYears(-3);
+            top10.AddRange(movies
+                .Where(m => !top10.Contains(m.Id) && (m.PremiereDate ?? DateTime.MinValue) >= recent)
+                .OrderByDescending(m => Math.Log10(1 + (ratings.GetValueOrDefault(m.Id)?.Votes ?? 0)) * Weighted(m, 5000))
+                .Select(m => m.Id)
+                .Take(10 - top10.Count));
+        }
+
+        var trending = day.Concat(week)
+            .Select(t => byTmdb.GetValueOrDefault(t.Id))
+            .Where(m => m is not null)
+            .Select(m => m!.Id)
+            .Distinct()
+            .Take(30)
+            .ToList();
+
+        var topRated = movies
+            .Where(m => (ratings.GetValueOrDefault(m.Id)?.Votes ?? 0) >= 25000)
+            .OrderByDescending(m => Weighted(m, 25000))
+            .Select(m => m.Id)
+            .Take(30)
+            .ToList();
+
+        var seed = DateTime.UtcNow.DayOfYear;
+        var gems = movies
+            .Where(m => ratings.GetValueOrDefault(m.Id) is { Rating: >= 7.0f, Votes: >= 1500 and <= 60000 } && !m.IsPlayed(user, null))
+            .OrderByDescending(m => Weighted(m, 1500))
+            .Take(60)
+            .OrderBy(m => (m.Id.GetHashCode() ^ seed) & 0xffff)
+            .Select(m => m.Id)
+            .Take(30)
+            .ToList();
+
+        var classics = movies
+            .Where(m => m.ProductionYear is > 0 and <= 1990 && (ratings.GetValueOrDefault(m.Id)?.Votes ?? 0) >= 15000)
+            .OrderByDescending(m => Weighted(m, 15000))
+            .Select(m => m.Id)
+            .Take(30)
+            .ToList();
+
+        var today = DateTime.UtcNow.Date;
+        UpcomingRelease ToRelease(TMDbLib.Objects.Search.SearchMovie m, string kind) => new()
+        {
+            Kind = kind,
+            TmdbId = m.Id,
+            Title = m.Title ?? m.OriginalTitle ?? string.Empty,
+            ReleaseDate = ToUtcDate(m.ReleaseDate ?? today),
+            Overview = m.Overview,
+            ImageUrl = _tmdb.GetImageUrl("w342", m.PosterPath),
+            BackdropUrl = _tmdb.GetImageUrl("w1280", m.BackdropPath),
+            Rating = m.VoteAverage > 0 ? m.VoteAverage : null,
+            RelatedItemId = byTmdb.GetValueOrDefault(m.Id)?.Id
+        };
+
+        var rows = new LibraryDiscovery
+        {
+            Top10 = top10,
+            Trending = trending,
+            TopRated = topRated,
+            HiddenGems = gems,
+            Classics = classics,
+            Upcoming = upcoming
+                .Where(m => m.ReleaseDate is DateTime d && d.Date > today && !byTmdb.ContainsKey(m.Id) && !string.IsNullOrEmpty(m.PosterPath))
+                .OrderBy(m => m.ReleaseDate)
+                .Take(20)
+                .Select(m => ToRelease(m, "Upcoming"))
+                .ToList(),
+            NowPlaying = nowPlaying
+                .Where(m => !string.IsNullOrEmpty(m.PosterPath))
+                .OrderByDescending(m => m.Popularity)
+                .Take(20)
+                .Select(m => ToRelease(m, "NowPlaying"))
+                .ToList()
+        };
+
+        _libraryRows[key] = (DateTime.UtcNow, rows);
+        return rows;
+    }
+
+    /// <inheritdoc />
+    public async Task<TrailerInfo?> GetTrailerAsync(int tmdbId, bool isSeries, string? language, string? country, string? originalLanguage, CancellationToken cancellationToken)
+        => (await GetTrailerCandidatesAsync(tmdbId, isSeries, language, country, originalLanguage, cancellationToken).ConfigureAwait(false)).FirstOrDefault();
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<TrailerInfo>> GetTrailerCandidatesAsync(int tmdbId, bool isSeries, string? language, string? country, string? originalLanguage, CancellationToken cancellationToken)
+    {
+        var candidates = new List<TrailerInfo>();
+        // Languages to try, best first
+        var lang = string.IsNullOrEmpty(language) ? "en" : language;
+        var baseLang = lang.Split('-')[0].ToLowerInvariant();
+        var region = !string.IsNullOrEmpty(country) ? country.ToUpperInvariant() : (lang.Contains('-', StringComparison.Ordinal) ? lang.Split('-')[1].ToUpperInvariant() : null);
+        if (region == "419")
+        {
+            region = "MX";
+        }
+
+        var tries = new List<string>();
+        void Try(string code)
+        {
+            if (!tries.Contains(code, StringComparer.OrdinalIgnoreCase))
+            {
+                tries.Add(code);
+            }
+        }
+
+        if (region is not null)
+        {
+            Try(baseLang + "-" + region);
+        }
+
+        if (baseLang == "es")
+        {
+            Try("es-MX");
+            Try("es-AR");
+            Try("es-ES");
+        }
+
+        Try(baseLang);
+        Try("en-US");
+        Try("en");
+
+        var original = originalLanguage;
+        if (string.IsNullOrEmpty(original) && !isSeries)
+        {
+            try
+            {
+                original = (await _tmdb.GetMovieAsync(tmdbId, null, null, null, cancellationToken).ConfigureAwait(false))?.OriginalLanguage;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "TMDb movie {Id} not available", tmdbId);
+            }
+        }
+
+        if (!string.IsNullOrEmpty(original))
+        {
+            Try(original.Split('-')[0].ToLowerInvariant());
+        }
+
+        foreach (var code in tries)
+        {
+            IReadOnlyList<TMDbLib.Objects.General.Video> videos;
+            try
+            {
+                videos = await _tmdb.GetVideosAsync(tmdbId, isSeries, code, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "TMDb videos of {Id} in {Language} not available", tmdbId, code);
+                continue;
+            }
+
+            // Trailer over teaser, official first, dubbed over subtitled, newest first; two per language
+            var ranked = videos
+                .Where(v => string.Equals(v.Site, "YouTube", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(v.Key)
+                    && (string.Equals(v.Type, "Trailer", StringComparison.OrdinalIgnoreCase) || string.Equals(v.Type, "Teaser", StringComparison.OrdinalIgnoreCase)))
+                .OrderByDescending(v => string.Equals(v.Type, "Trailer", StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(v => v.Official)
+                .ThenByDescending(v => (v.Name ?? string.Empty).Contains("doblad", StringComparison.OrdinalIgnoreCase))
+                .ThenBy(v => (v.Name ?? string.Empty).Contains("subtitulad", StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(v => v.PublishedAt)
+                .Take(2);
+
+            foreach (var video in ranked)
+            {
+                if (!candidates.Any(c => c.Key == video.Key))
+                {
+                    candidates.Add(new TrailerInfo { Key = video.Key!, Name = video.Name ?? string.Empty, Language = code });
+                }
+            }
+
+            if (candidates.Count >= 6)
+            {
+                break;
+            }
+        }
+
+        return candidates;
     }
 
     /// <inheritdoc />

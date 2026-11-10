@@ -113,4 +113,23 @@ public class EnumerableExtensionsTests
         Assert.Null(result[2].Language);
         Assert.Equal("fr", result[3].Language);
     }
+
+    [Fact]
+    public void OrderByLanguageDescending_LatinAmericanSpanish()
+    {
+        var images = new[]
+        {
+            new RemoteImageInfo { Language = "en", CommunityRating = 9.0 },
+            new RemoteImageInfo { Language = null, CommunityRating = 9.5 },
+            new RemoteImageInfo { Language = "ja", CommunityRating = 9.9 },
+            new RemoteImageInfo { Language = "es-ES", CommunityRating = 8.0 },
+            new RemoteImageInfo { Language = "es", CommunityRating = 7.0 },
+            new RemoteImageInfo { Language = "es-AR", CommunityRating = 6.0 },
+            new RemoteImageInfo { Language = "es-MX", CommunityRating = 5.0 },
+        };
+
+        var result = images.OrderByLanguageDescending("es-419", "MX", "ja").Select(i => i.Language).ToList();
+
+        Assert.Equal(new[] { "es-MX", "es-AR", "es", "es-ES", "en", "ja", null }, result);
+    }
 }

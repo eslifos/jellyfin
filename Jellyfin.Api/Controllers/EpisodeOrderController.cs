@@ -95,6 +95,43 @@ public class EpisodeOrderController : BaseJellyfinApiController
     }
 
     /// <summary>
+    /// Saves the display order and main source and refreshes the series and its episodes right away.
+    /// </summary>
+    /// <param name="seriesId">The series id.</param>
+    /// <param name="order">The display order (empty = aired).</param>
+    /// <param name="source">The main source (empty = library order).</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <response code="202">Refresh started.</response>
+    /// <response code="400">Unknown source.</response>
+    /// <response code="404">Series not found.</response>
+    /// <response code="409">The series is already being refreshed.</response>
+    /// <returns>Accepted.</returns>
+    [HttpPost("{seriesId}/Apply")]
+    [ProducesResponseType(StatusCodes.Status202Accepted)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult> Apply([FromRoute] Guid seriesId, [FromQuery] string? order, [FromQuery] string? source, CancellationToken cancellationToken = default)
+    {
+        if (_libraryManager.GetItemById(seriesId) is not Series series)
+        {
+            return NotFound();
+        }
+
+        if (!string.IsNullOrEmpty(source))
+        {
+            var analysis = await _episodeOrder.AnalyzeAsync(series, false, cancellationToken).ConfigureAwait(false);
+            if (!analysis.Sources.Contains(source, StringComparer.OrdinalIgnoreCase))
+            {
+                return BadRequest();
+            }
+        }
+
+        var started = await _episodeOrder.ApplyAsync(series, order?.Trim() ?? string.Empty, string.IsNullOrEmpty(source) ? null : source, cancellationToken).ConfigureAwait(false);
+        return started ? Accepted() : Conflict();
+    }
+
+    /// <summary>
     /// Reads again the season / episode numbers of files that have none.
     /// </summary>
     /// <param name="seriesId">The series id.</param>

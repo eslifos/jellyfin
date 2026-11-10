@@ -324,7 +324,13 @@ namespace MediaBrowser.Providers.Manager
 
             var results = await Task.WhenAll(tasks).ConfigureAwait(false);
 
-            return results.SelectMany(i => i);
+            // One list for all providers, best language first. The sort is stable, so for the same language
+            // the provider order of the library and each provider's own ranking are kept.
+            var countryCode = item.GetPreferredMetadataCountryCode();
+            var originalLanguage = ItemImageProvider.GetOriginalLanguage(item);
+            return results.SelectMany(i => i)
+                .OrderByDescending(i => MediaBrowser.Model.Extensions.EnumerableExtensions.GetLanguageScore(i.Language, preferredLanguage, countryCode, originalLanguage))
+                .ToList();
         }
 
         /// <summary>
@@ -361,12 +367,13 @@ namespace MediaBrowser.Providers.Manager
                     // Filter out languages that do not match the preferred languages.
                     //
                     // TODO: should exception case of "en" (English) eventually be removed?
-                    result = result.Where(i => string.IsNullOrWhiteSpace(i.Language) ||
-                                               string.Equals(preferredLanguage, i.Language, StringComparison.OrdinalIgnoreCase) ||
-                                               string.Equals(i.Language, "en", StringComparison.OrdinalIgnoreCase));
+                    // Any variant of the preferred language counts (es-MX / es / es-ES for es-419), then English and the original language.
+                    var countryCode = item.GetPreferredMetadataCountryCode();
+                    result = result.Where(i => MediaBrowser.Model.Extensions.EnumerableExtensions.GetLanguageScore(i.Language, preferredLanguage, countryCode, ItemImageProvider.GetOriginalLanguage(item)) >= 20
+                                               || string.IsNullOrWhiteSpace(i.Language));
                 }
 
-                return result.OrderByLanguageDescending(preferredLanguage);
+                return result.OrderByLanguageDescending(preferredLanguage, item.GetPreferredMetadataCountryCode(), ItemImageProvider.GetOriginalLanguage(item));
             }
             catch (OperationCanceledException)
             {

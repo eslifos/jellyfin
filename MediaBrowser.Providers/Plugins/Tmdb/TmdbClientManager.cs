@@ -14,6 +14,7 @@ using TMDbLib.Objects.General;
 using TMDbLib.Objects.Movies;
 using TMDbLib.Objects.People;
 using TMDbLib.Objects.Search;
+using TMDbLib.Objects.Trending;
 using TMDbLib.Objects.TvShows;
 
 namespace MediaBrowser.Providers.Plugins.Tmdb
@@ -537,6 +538,99 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             return searchResults?.Results;
         }
+
+        /// <summary>
+        /// Gets a TMDb movie list: "trending-day", "trending-week", "popular", "upcoming" or "now-playing".
+        /// Cached for 3 hours.
+        /// </summary>
+        /// <param name="list">The list.</param>
+        /// <param name="language">The language (e.g. es-419).</param>
+        /// <param name="countryCode">The country (region for upcoming / now playing).</param>
+        /// <param name="pages">How many pages of 20 movies to read.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The movies, in the list order.</returns>
+        public async Task<IReadOnlyList<SearchMovie>> GetMovieListAsync(string list, string? language, string? countryCode, int pages, CancellationToken cancellationToken)
+        {
+            var lang = TmdbUtils.NormalizeLanguage(language, countryCode);
+            var key = $"movielist-{list}-{lang}-{countryCode}-{pages.ToString(CultureInfo.InvariantCulture)}";
+            if (_memoryCache.TryGetValue(key, out List<SearchMovie>? cached) && cached is not null)
+            {
+                return cached;
+            }
+
+            await EnsureClientConfigAsync().ConfigureAwait(false);
+
+            var result = new List<SearchMovie>();
+            var seen = new HashSet<int>();
+            for (var page = 1; page <= pages; page++)
+            {
+                SearchContainer<SearchMovie>? container = list switch
+                {
+                    "trending-day" => await _tmDbClient.GetTrendingMoviesAsync(TimeWindow.Day, page, lang, cancellationToken).ConfigureAwait(false),
+                    "trending-week" => await _tmDbClient.GetTrendingMoviesAsync(TimeWindow.Week, page, lang, cancellationToken).ConfigureAwait(false),
+                    "popular" => await _tmDbClient.GetMoviePopularListAsync(lang, page, countryCode, cancellationToken).ConfigureAwait(false),
+                    "upcoming" => await _tmDbClient.GetMovieUpcomingListAsync(lang, page, countryCode, cancellationToken).ConfigureAwait(false),
+                    "now-playing" => await _tmDbClient.GetMovieNowPlayingListAsync(lang, page, countryCode, cancellationToken).ConfigureAwait(false),
+                    _ => null
+                };
+
+                if (container?.Results is null || container.Results.Count == 0)
+                {
+                    break;
+                }
+
+                foreach (var movie in container.Results)
+                {
+                    if (seen.Add(movie.Id))
+                    {
+                        result.Add(movie);
+                    }
+                }
+
+                if (page >= container.TotalPages)
+                {
+                    break;
+                }
+            }
+
+            _memoryCache.Set(key, result, new MemoryCacheEntryOptions().SetSize(1).SetAbsoluteExpiration(TimeSpan.FromHours(3)));
+            return result;
+        }
+
+        /// <summary>
+        /// Gets the videos (trailers, teasers…) of a movie or series in one language ("es-MX", "en-US"…). Cached for 12 hours.
+        /// </summary>
+        /// <param name="tmdbId">The TMDb id.</param>
+        /// <param name="isSeries">Whether it is a series.</param>
+        /// <param name="language">The language with region.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The videos.</returns>
+        public async Task<IReadOnlyList<Video>> GetVideosAsync(int tmdbId, bool isSeries, string language, CancellationToken cancellationToken)
+        {
+            var key = $"videos-{(isSeries ? "tv" : "movie")}-{tmdbId.ToString(CultureInfo.InvariantCulture)}-{language}";
+            if (_memoryCache.TryGetValue(key, out List<Video>? cached) && cached is not null)
+            {
+                return cached;
+            }
+
+            await EnsureClientConfigAsync().ConfigureAwait(false);
+
+            var container = isSeries
+                ? await _tmDbClient.GetTvShowVideosAsync(tmdbId, language, cancellationToken).ConfigureAwait(false)
+                : await _tmDbClient.GetMovieVideosAsync(tmdbId, language, cancellationToken).ConfigureAwait(false);
+
+            var result = container?.Results ?? [];
+            _memoryCache.Set(key, result, new MemoryCacheEntryOptions().SetSize(1).SetAbsoluteExpiration(TimeSpan.FromHours(12)));
+            return result;
+        }
+
+        /// <summary>
+        /// Gets the absolute URL of a TMDb image at the given size.
+        /// </summary>
+        /// <param name="size">The TMDb size (w342, w780…).</param>
+        /// <param name="path">The relative path.</param>
+        /// <returns>The absolute URL.</returns>
+        public string? GetImageUrl(string size, string? path) => GetUrl(size, path);
 
         /// <summary>
         /// Gets a single page of recommended movies for a movie from the TMDb API.
