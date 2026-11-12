@@ -208,6 +208,7 @@ public class LibraryStructureController : BaseJellyfinApiController
                 newLibraryId,
                 oldLibraryName,
                 Path.GetFileName(newPath),
+                oldLibrary?.CollectionType,
                 oldLibrary?.CollectionType).ConfigureAwait(false);
         }
         finally
@@ -264,11 +265,12 @@ public class LibraryStructureController : BaseJellyfinApiController
         Guid newId,
         string oldName,
         string newName,
-        CollectionType? viewType)
+        CollectionType? oldViewType,
+        CollectionType? newViewType)
     {
         var shadowView = (
-            Old: _libraryManager.GetShadowViewId(oldName, oldId, viewType),
-            New: _libraryManager.GetShadowViewId(newName, newId, viewType));
+            Old: _libraryManager.GetShadowViewId(oldName, oldId, oldViewType),
+            New: _libraryManager.GetShadowViewId(newName, newId, newViewType));
 
         if (oldId.Equals(newId) && shadowView.Old.Equals(shadowView.New))
         {
@@ -295,7 +297,7 @@ public class LibraryStructureController : BaseJellyfinApiController
             var viewMap = new Dictionary<Guid, Guid>(libraryMap)
             {
                 [shadowView.Old] = shadowView.New,
-                [_libraryManager.GetNamedViewId(user, oldId, viewType)] = _libraryManager.GetNamedViewId(user, newId, viewType)
+                [_libraryManager.GetNamedViewId(user, oldId, oldViewType)] = _libraryManager.GetNamedViewId(user, newId, newViewType)
             };
 
             var changed = false;
@@ -351,6 +353,81 @@ public class LibraryStructureController : BaseJellyfinApiController
         }
 
         return touched;
+    }
+
+    /// <summary>
+    /// Changes the type of a library, for example from mixed movies and shows to shows.
+    /// The library keeps its id, options and images. Items that keep their type keep their id and metadata;
+    /// only the items that the new type sees differently are identified again on the next scan.
+    /// </summary>
+    /// <param name="name">The name of the library.</param>
+    /// <param name="collectionType">The new type.</param>
+    /// <response code="204">Type changed.</response>
+    /// <response code="400">The type cannot be used for a library.</response>
+    /// <response code="404">Library doesn't exist.</response>
+    /// <returns>A <see cref="NoContentResult"/>.</returns>
+    [HttpPost("CollectionType")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> UpdateCollectionType(
+        [FromQuery, Required] string name,
+        [FromQuery, Required] CollectionTypeOptions collectionType)
+    {
+        if (collectionType == CollectionTypeOptions.boxsets)
+        {
+            return BadRequest("Collections cannot be used as a library type.");
+        }
+
+        var path = FileSystemHelper.GetChildPath(_appPaths.DefaultUserViewsPath, name);
+        if (path is null || !Directory.Exists(path))
+        {
+            return NotFound("The media collection does not exist.");
+        }
+
+        var library = FindLibrary(path);
+        CollectionType? newType = Enum.TryParse<CollectionType>(collectionType.ToString(), out var parsed) ? parsed : null;
+
+        _libraryMonitor.Stop();
+        try
+        {
+            // The type is the "<type>.collection" file in the library folder
+            foreach (var file in Directory.EnumerateFiles(path, "*.collection", SearchOption.TopDirectoryOnly).ToList())
+            {
+                System.IO.File.Delete(file);
+            }
+
+            var typeFile = Path.Combine(path, collectionType.ToString().ToLowerInvariant() + ".collection");
+            await System.IO.File.WriteAllBytesAsync(typeFile, []).ConfigureAwait(false);
+            _directoryService.Invalidate(path);
+
+            if (library is not null && library.CollectionType != newType)
+            {
+                // Home screen order and hidden views use ids that include the type
+                await ReplaceLibraryIdInUserPreferencesAsync(
+                    library.Id,
+                    library.Id,
+                    library.Name,
+                    library.Name,
+                    library.CollectionType,
+                    newType).ConfigureAwait(false);
+
+                library.CollectionType = newType;
+                await library.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            CollectionFolder.OnCollectionFolderChange();
+            _ = Task.Run(async () =>
+            {
+                // Need to add a delay here or directory watchers may still pick up the changes
+                await Task.Delay(1000).ConfigureAwait(false);
+                _libraryMonitor.Start();
+            });
+        }
+
+        return NoContent();
     }
 
     /// <summary>

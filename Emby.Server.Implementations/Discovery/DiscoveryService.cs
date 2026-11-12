@@ -17,6 +17,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Discovery;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Providers.Plugins.Tmdb;
+using TMDbLib.Objects.Find;
 using Microsoft.Extensions.Logging;
 
 namespace Emby.Server.Implementations.Discovery;
@@ -28,6 +29,7 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
 {
     private static readonly TimeSpan _heroMaxAge = TimeSpan.FromHours(3);
     private static readonly TimeSpan _upcomingMaxAge = TimeSpan.FromHours(12);
+    private static readonly TimeSpan _upcomingDirtyDelay = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan _popularityMaxAge = TimeSpan.FromHours(24);
     private const int TmdbLookups = 40;
 
@@ -39,6 +41,8 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     private readonly SemaphoreSlim _heroLock = new(1, 1);
     private readonly SemaphoreSlim _upcomingLock = new(1, 1);
     private readonly ConcurrentDictionary<string, (DateTime At, double? Popularity)> _popularity = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<Guid, int?> _seriesTmdb = new();
+    private volatile bool _upcomingDirty;
 
     private (DateTime Built, List<HeroPick> Picks)? _hero;
     private (DateTime Built, List<UpcomingRelease> Releases)? _upcoming;
@@ -60,6 +64,9 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
         _imdb = imdb;
         _config = config;
         _logger = logger;
+        _libraryManager.ItemAdded += OnLibraryChanged;
+        _libraryManager.ItemUpdated += OnLibraryChanged;
+        _libraryManager.ItemRemoved += OnLibraryChanged;
     }
 
     /// <inheritdoc />
@@ -96,18 +103,19 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     /// <inheritdoc />
     public async Task<IReadOnlyList<UpcomingRelease>> GetUpcomingAsync(User user, DateTime from, DateTime to, CancellationToken cancellationToken)
     {
-        var releases = _upcoming is { } cached && DateTime.UtcNow - cached.Built < _upcomingMaxAge ? cached.Releases : null;
+        var releases = _upcoming is { } cached && IsUpcomingFresh(cached.Built) ? cached.Releases : null;
         if (releases is null)
         {
             await _upcomingLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                if (_upcoming is { } again && DateTime.UtcNow - again.Built < _upcomingMaxAge)
+                if (_upcoming is { } again && IsUpcomingFresh(again.Built))
                 {
                     releases = again.Releases;
                 }
                 else
                 {
+                    _upcomingDirty = false;
                     releases = await BuildUpcomingAsync(cancellationToken).ConfigureAwait(false);
                     _upcoming = (DateTime.UtcNow, releases);
                 }
@@ -416,12 +424,88 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     /// <inheritdoc />
     public void Dispose()
     {
+        _libraryManager.ItemAdded -= OnLibraryChanged;
+        _libraryManager.ItemUpdated -= OnLibraryChanged;
+        _libraryManager.ItemRemoved -= OnLibraryChanged;
         _heroLock.Dispose();
         _upcomingLock.Dispose();
     }
 
     private static int? TmdbId(BaseItem item)
         => int.TryParse(item.GetProviderId(MetadataProvider.Tmdb), NumberStyles.Integer, CultureInfo.InvariantCulture, out var id) && id > 0 ? id : null;
+
+    /// <summary>Rebuilt every 12 hours, or 10 minutes after series or movies are added, identified or removed (new libraries too).</summary>
+    private bool IsUpcomingFresh(DateTime built)
+    {
+        var age = DateTime.UtcNow - built;
+        return age < _upcomingMaxAge && !(_upcomingDirty && age > _upcomingDirtyDelay);
+    }
+
+    private void OnLibraryChanged(object? sender, ItemChangeEventArgs e)
+    {
+        if (e.Item is Series or Movie)
+        {
+            _upcomingDirty = true;
+            if (e.Item is Series)
+            {
+                _seriesTmdb.TryRemove(e.Item.Id, out _);
+            }
+        }
+    }
+
+    /// <summary>
+    /// TMDb id of a series. Libraries identified with other providers (TheTVDB, AniDB, AniList…) have no TMDb id,
+    /// so it is looked up from the TheTVDB or IMDb id, and as a last resort by exact name and year.
+    /// </summary>
+    private async Task<int?> ResolveSeriesTmdbAsync(Series series, string language, string? country, CancellationToken cancellationToken)
+    {
+        if (TmdbId(series) is int id)
+        {
+            return id;
+        }
+
+        if (_seriesTmdb.TryGetValue(series.Id, out var cached))
+        {
+            return cached;
+        }
+
+        int? found = null;
+        try
+        {
+            foreach (var (provider, source) in new[] { (MetadataProvider.Tvdb, FindExternalSource.TvDb), (MetadataProvider.Imdb, FindExternalSource.Imdb) })
+            {
+                var external = series.GetProviderId(provider);
+                if (string.IsNullOrEmpty(external))
+                {
+                    continue;
+                }
+
+                var result = await _tmdb.FindByExternalIdAsync(external, source, language, country, cancellationToken).ConfigureAwait(false);
+                if (result?.TvResults is { Count: > 0 } tv)
+                {
+                    found = tv[0].Id;
+                    break;
+                }
+            }
+
+            if (found is null && series.ProductionYear is int year && year > 0 && !string.IsNullOrEmpty(series.Name))
+            {
+                var names = new[] { series.Name, series.OriginalTitle }.Where(n => !string.IsNullOrEmpty(n)).ToList();
+                var hits = await _tmdb.SearchSeriesAsync(series.OriginalTitle ?? series.Name, language, country, year, cancellationToken).ConfigureAwait(false);
+                found = hits?.FirstOrDefault(h => names.Any(n =>
+                    string.Equals(h.Name, n, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(h.OriginalName, n, StringComparison.OrdinalIgnoreCase)))?.Id;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "TMDb id of {Name} not found", series.Name);
+            return null; // try again on the next build
+        }
+
+        _seriesTmdb[series.Id] = found;
+        return found;
+    }
 
     private static DateTime ToUtcDate(DateTime date) => DateTime.SpecifyKind(date.Date, DateTimeKind.Utc);
 
@@ -586,16 +670,24 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
         var result = new ConcurrentBag<UpcomingRelease>();
 
         // Next episodes of the series that are still running
-        var series = _libraryManager.GetItemList(new InternalItemsQuery { IncludeItemTypes = [BaseItemKind.Series], Recursive = true })
+        // Every library (shows, movies, mixed, anime...), whatever provider identified the series
+        var series = _libraryManager.GetItemList(new InternalItemsQuery { IncludeItemTypes = [BaseItemKind.Series], Recursive = true, IsVirtualItem = false })
             .OfType<Series>()
-            .Where(s => s.Status != SeriesStatus.Ended && TmdbId(s) is not null)
+            .Where(s => s.Status != SeriesStatus.Ended)
             .ToList();
+        var lookupLanguage = string.IsNullOrEmpty(language) ? "en" : language;
+        var withoutTmdb = 0;
 
         await Parallel.ForEachAsync(series, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken }, async (item, ct) =>
         {
             try
             {
-                var id = TmdbId(item)!.Value;
+                if (await ResolveSeriesTmdbAsync(item, lookupLanguage, country, ct).ConfigureAwait(false) is not int id)
+                {
+                    Interlocked.Increment(ref withoutTmdb);
+                    return;
+                }
+
                 var show = await _tmdb.GetSeriesAsync(id, language, null, country, ct).ConfigureAwait(false);
                 var next = show?.NextEpisodeToAir;
                 if (next?.AirDate is null)
@@ -668,7 +760,7 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
         }).ConfigureAwait(false);
 
         var list = result.OrderBy(r => r.ReleaseDate).ThenBy(r => r.SeriesName ?? r.Title, StringComparer.Ordinal).ToList();
-        _logger.LogInformation("Upcoming from TMDb: {Episodes} episodes of {Series} series, {Movies} saga movies", list.Count(r => r.Kind == "Episode"), series.Count, list.Count(r => r.Kind == "Movie"));
+        _logger.LogInformation("Upcoming from TMDb: {Episodes} episodes of {Series} running series ({Missing} not found on TMDb), {Movies} saga movies", list.Count(r => r.Kind == "Episode"), series.Count, withoutTmdb, list.Count(r => r.Kind == "Movie"));
         return list;
 
         UpcomingRelease Episode(Series item, int tmdbId, string? name, string? overview, string? still, DateTime date, int season, int number) => new()
