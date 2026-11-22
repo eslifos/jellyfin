@@ -54,6 +54,35 @@ public class ItemCountService : IItemCountService
     }
 
     /// <inheritdoc />
+    public ItemFileTotals GetFileTotals(InternalItemsQuery filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        _queryHelpers.PrepareFilterQuery(filter);
+
+        using var context = _dbProvider.CreateDbContext();
+        var dbQuery = _queryHelpers.TranslateQuery(context.BaseItems.AsNoTracking(), context, filter);
+
+        var rows = dbQuery
+            .GroupBy(x => x.Type)
+            .Select(x => new
+            {
+                x.Key,
+                Count = x.Count(),
+                Size = x.Sum(e => e.Size ?? 0),
+                RunTime = x.Sum(e => e.RunTimeTicks ?? 0)
+            })
+            .ToArray();
+
+        var lookup = _itemTypeLookup.BaseItemKindNames;
+        return new ItemFileTotals(
+            rows.Sum(r => r.Count),
+            rows.Sum(r => r.Size),
+            rows.Sum(r => r.RunTime),
+            rows.Where(r => string.Equals(r.Key, lookup[BaseItemKind.Photo], StringComparison.Ordinal)).Sum(r => r.Count),
+            rows.Where(r => string.Equals(r.Key, lookup[BaseItemKind.Video], StringComparison.Ordinal)).Sum(r => r.Count));
+    }
+
+    /// <inheritdoc />
     public ItemCounts GetItemCounts(InternalItemsQuery filter)
     {
         ArgumentNullException.ThrowIfNull(filter);
@@ -118,6 +147,18 @@ public class ItemCountService : IItemCountService
             {
                 result.BookCount = count.Count;
             }
+        }
+
+        // Audiobooks are books, not music: a book in parts is an album holding its parts (count it as a book,
+        // not as an album) and a single-file audiobook is a book; the parts themselves are not books
+        var audioBookType = lookup[BaseItemKind.AudioBook];
+        var albumType = lookup[BaseItemKind.MusicAlbum];
+        if (counts.Any(c => string.Equals(c.Key, audioBookType, StringComparison.Ordinal) || string.Equals(c.Key, albumType, StringComparison.Ordinal)))
+        {
+            var booksInParts = dbQuery.Count(e => e.Type == albumType && context.BaseItems.Any(c => c.ParentId == e.Id && c.Type == audioBookType));
+            var singleFileBooks = dbQuery.Count(e => e.Type == audioBookType && !context.BaseItems.Any(p => p.Id == e.ParentId && p.Type == albumType));
+            result.AlbumCount = Math.Max(0, result.AlbumCount - booksInParts);
+            result.BookCount += booksInParts + singleFileBooks;
         }
 
         return result;

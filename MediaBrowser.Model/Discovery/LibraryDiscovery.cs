@@ -14,6 +14,11 @@ public class LibraryDiscovery
     public IReadOnlyList<Guid> Top10 { get; set; } = [];
 
     /// <summary>
+    /// Gets or sets a value indicating whether the top 10 was picked by hand (it is shown as is, not completed).
+    /// </summary>
+    public bool Top10Manual { get; set; }
+
+    /// <summary>
     /// Gets or sets the library movies that are trending on TMDb today and this week.
     /// </summary>
     public IReadOnlyList<Guid> Trending { get; set; } = [];

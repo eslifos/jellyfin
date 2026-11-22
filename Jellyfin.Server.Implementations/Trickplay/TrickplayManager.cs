@@ -488,6 +488,9 @@ public partial class TrickplayManager : ITrickplayManager
                 }
 
                 _logger.LogInformation("Creating trickplay files at {Width} width, for {Path} [ID: {ItemId}]", actualWidth, mediaPath, video.Id);
+
+                // Shown live in the dashboard while the thumbnails are created
+                using var trickplayActivity = MediaBrowser.Controller.Library.LibraryActivity.Begin(video, MediaBrowser.Controller.Library.LibraryActivityKind.Trickplay);
                 imgTempDir = await _mediaEncoder.ExtractVideoImagesOnIntervalAccelerated(
                     mediaPath,
                     container,

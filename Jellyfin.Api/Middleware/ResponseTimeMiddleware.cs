@@ -48,7 +48,17 @@ public class ResponseTimeMiddleware
         {
             var responseTime = Stopwatch.GetElapsedTime(startTimestamp);
             var responseTimeMs = responseTime.TotalMilliseconds;
-            if (enableWarning && responseTimeMs > warningThreshold && _logger.IsEnabled(LogLevel.Debug))
+            // Very slow answers (over 2 s) always go to the log: they tell what loads the server
+            if (enableWarning && responseTimeMs > System.Math.Max(warningThreshold, 2000))
+            {
+                _logger.LogWarning(
+                    "Slow HTTP Response from {Url} to {RemoteIP} in {Elapsed:g} with Status Code {StatusCode}",
+                    context.Request.GetDisplayUrl(),
+                    context.GetNormalizedRemoteIP(),
+                    responseTime,
+                    context.Response.StatusCode);
+            }
+            else if (enableWarning && responseTimeMs > warningThreshold && _logger.IsEnabled(LogLevel.Debug))
             {
                 _logger.LogDebug(
                     "Slow HTTP Response from {Url} to {RemoteIP} in {Elapsed:g} with Status Code {StatusCode}",

@@ -61,6 +61,11 @@ namespace Emby.Server.Implementations.Library.Resolvers.Audio
             List<FileSystemMetadata> files,
             CollectionType? collectionType)
         {
+            if (collectionType == CollectionType.books && parent is MediaBrowser.Controller.Entities.Audio.MusicAlbum)
+            {
+                return ResolveBookParts(files);
+            }
+
             if (collectionType == CollectionType.books)
             {
                 return ResolveMultipleAudio(parent, files, true);
@@ -137,6 +142,48 @@ namespace Emby.Server.Implementations.Library.Resolvers.Audio
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Every audio file of a book stored as a folder of parts is one part, in the order of its number,
+        /// so it keeps its own resume position.
+        /// </summary>
+        private MultiItemResolverResult ResolveBookParts(List<FileSystemMetadata> files)
+        {
+            var result = new MultiItemResolverResult
+            {
+                ExtraFiles = new List<FileSystemMetadata>(),
+                Items = new List<BaseItem>()
+            };
+
+            foreach (var file in files)
+            {
+                if (file.IsDirectory
+                    || !AudioFileParser.IsAudioFile(file.FullName, _namingOptions)
+                    || file.FullName.EndsWith(".cue", StringComparison.OrdinalIgnoreCase))
+                {
+                    result.ExtraFiles.Add(file);
+                    continue;
+                }
+
+                // The part number orders the parts even without leading zeros: "7", "07 - Title", "Capítulo 7", "Parte 7"
+                var name = Path.GetFileNameWithoutExtension(file.FullName);
+                var digits = new string(name.TrimStart().TakeWhile(char.IsDigit).ToArray());
+                if (digits.Length == 0
+                    && System.Text.RegularExpressions.Regex.Match(name, @"(?:cap[ií]tulo|cap|chapter|ch|parte|part|pista|track|cd|disco|disc|libro)\s*(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase) is { Success: true } numbered)
+                {
+                    digits = numbered.Groups[1].Value;
+                }
+                result.Items.Add(new AudioBook
+                {
+                    Path = file.FullName,
+                    Name = name,
+                    IsInMixedFolder = true,
+                    IndexNumber = digits.Length is > 0 and < 6 ? int.Parse(digits, System.Globalization.CultureInfo.InvariantCulture) : null
+                });
+            }
+
+            return result;
         }
 
         private AudioBook FindAudioBook(ItemResolveArgs args, bool parseName)

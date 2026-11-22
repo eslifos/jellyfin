@@ -70,6 +70,42 @@ public sealed partial class BaseItemRepository
     private static string NormalizeLanguage(string language)
         => string.Equals(language, "und", StringComparison.OrdinalIgnoreCase) ? "und" : language;
 
+    // A book in parts (a folder of numbered files in a books library) is one MusicAlbum holding an AudioBook
+    // per part. Library-wide lists show the book, not each part: otherwise a book shows up once per part.
+    // The parts are still listed inside their book, when resuming, by id and by the library scan.
+    private IQueryable<BaseItemEntity> HideAudiobookParts(JellyfinDbContext context, IQueryable<BaseItemEntity> baseQuery, InternalItemsQuery filter)
+    {
+        if (!filter.ParentId.IsEmpty()
+            || filter.ItemIds.Length > 0
+            || filter.IsResumable == true
+            || filter.IncludeAlternateVersions
+            || (filter.IncludeItemTypes.Length > 0 && !filter.IncludeItemTypes.Contains(BaseItemKind.AudioBook))
+            || filter.ExcludeItemTypes.Contains(BaseItemKind.AudioBook)
+            || (filter.MediaTypes.Length > 0 && !filter.MediaTypes.Contains(MediaType.Audio)))
+        {
+            return baseQuery;
+        }
+
+        if (!_itemTypeLookup.BaseItemKindNames.TryGetValue(BaseItemKind.AudioBook, out var audioBookType)
+            || !_itemTypeLookup.BaseItemKindNames.TryGetValue(BaseItemKind.MusicAlbum, out var albumType))
+        {
+            return baseQuery;
+        }
+
+        // Inside one book (playing it, its page) every part is wanted
+        if (filter.AncestorIds.Length > 0)
+        {
+            var ancestorIds = filter.AncestorIds;
+            if (context.BaseItems.Any(a => ancestorIds.Contains(a.Id) && a.Type == albumType))
+            {
+                return baseQuery;
+            }
+        }
+
+        return baseQuery.Where(e => e.Type != audioBookType
+            || !context.BaseItems.Any(p => p.Id == e.ParentId && p.Type == albumType));
+    }
+
     // The primary versions whose alternate version satisfies a dimension bound. Anchored on
     // PrimaryVersionId so the filtered index carries it rather than a scan of every item.
     private static IQueryable<Guid> VersionsMatchingDimension(JellyfinDbContext context, Expression<Func<BaseItemEntity, bool>> bound)
@@ -311,6 +347,8 @@ public sealed partial class BaseItemRepository
             string[] types = includeTypes.Select(f => _itemTypeLookup.BaseItemKindNames.GetValueOrDefault(f)).Where(e => e != null).ToArray()!;
             baseQuery = baseQuery.WhereOneOrMany(types, f => f.Type);
         }
+
+        baseQuery = HideAudiobookParts(context, baseQuery, filter);
 
         if (filter.ChannelIds.Count > 0)
         {
@@ -576,14 +614,22 @@ public sealed partial class BaseItemRepository
                     .Or(BuildHasDescendantFilter(context, leafItems.Where(BuildLeafIsPlayedFilter(context, userId)))
                         .And(BuildHasDescendantFilter(context, leafItems.Where(BuildLeafIsPlayedFilter(context, userId).Not())))));
 
+            // Series and seasons have no media type: a query by media type ("Continue watching/listening")
+            // or by other item types never returns them, and checking every played and unplayed episode of
+            // every folder for nothing took minutes on big libraries
+            var foldersPossible = filter.MediaTypes.Length == 0
+                && (filter.IncludeItemTypes.Length == 0 || filter.IncludeItemTypes.Any(_resumableFolderKinds.Contains));
+
             if (isResumable)
             {
                 // Resume queries surface the version that was actually played, which may be an alternate.
                 // Match each version on its own progress rather than coalescing onto the primary.
                 var inProgressIds = inProgress.Select(ud => ud.ItemId);
 
-                baseQuery = baseQuery.Where(folderIsResumableFilter
-                    .Or(IsFolderFilter.Not().And(e => inProgressIds.Contains(e.Id))));
+                baseQuery = foldersPossible
+                    ? baseQuery.Where(folderIsResumableFilter
+                        .Or(IsFolderFilter.Not().And(e => inProgressIds.Contains(e.Id))))
+                    : baseQuery.Where(e => !e.IsFolder && inProgressIds.Contains(e.Id));
 
                 // When several versions of the same item are in progress, keep only the most recently played one, use id as tiebreaker.
                 // Only in-progress siblings can eliminate a candidate: a version without progress has a NULL max LastPlayedDate,

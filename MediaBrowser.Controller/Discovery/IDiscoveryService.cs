@@ -36,9 +36,59 @@ public interface IDiscoveryService
     /// </summary>
     /// <param name="user">The user.</param>
     /// <param name="parentId">The library id.</param>
+    /// <param name="theme">"anime" or "kids": in theaters and upcoming only show movies of that kind.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>The rows.</returns>
-    Task<LibraryDiscovery> GetLibraryAsync(User user, Guid parentId, CancellationToken cancellationToken);
+    Task<LibraryDiscovery> GetLibraryAsync(User user, Guid parentId, string? theme, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Gets the top 10 of movies or series across all the user's libraries: what people watch right now on TMDb
+    /// (trending this week and today, popular), completed with the most voted recent titles.
+    /// </summary>
+    /// <param name="user">The user.</param>
+    /// <param name="series">True for series, false for movies.</param>
+    /// <param name="automatic">True to get the automatic list even when the top 10 is picked by hand.</param>
+    /// <param name="parentId">Only the titles of this library (all the libraries when null).</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The item ids, best ranked first.</returns>
+    Task<IReadOnlyList<Guid>> GetTop10Async(User user, bool series, bool automatic, Guid? parentId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Gets how the top 10 rows are built (automatic or by hand).
+    /// </summary>
+    /// <returns>The settings.</returns>
+    Top10Settings GetTop10Settings();
+
+    /// <summary>
+    /// Gets the banner picks of every library, without filtering by user (for the prepared home page).
+    /// </summary>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The picks, the best first.</returns>
+    Task<IReadOnlyList<HeroPick>> GetHeroPicksAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Gets the top 10 of a library, or of every library together (by hand or automatic), without filtering by user.
+    /// </summary>
+    /// <param name="series">True for series, false for movies.</param>
+    /// <param name="libraryId">The library, or null for all of them.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The item ids, best ranked first.</returns>
+    Task<IReadOnlyList<Guid>> GetTop10IdsAsync(bool series, Guid? libraryId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Gets the upcoming releases of every library, without filtering by user (for the prepared home page).
+    /// </summary>
+    /// <param name="from">First date.</param>
+    /// <param name="to">Last date.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The releases by date.</returns>
+    Task<IReadOnlyList<UpcomingRelease>> GetUpcomingAllAsync(DateTime from, DateTime to, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Saves how the top 10 rows are built and rebuilds them.
+    /// </summary>
+    /// <param name="settings">The settings.</param>
+    void SaveTop10Settings(Top10Settings settings);
 
     /// <summary>
     /// Gets the best trailer of a movie or series: library language first (es-MX), then the same language

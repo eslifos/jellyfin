@@ -8,8 +8,10 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Data.Events;
 using Jellyfin.Extensions.Json;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Entities;
@@ -24,16 +26,24 @@ namespace Emby.Server.Implementations.MetaUniverses;
 
 /// <summary>
 /// Builds the meta universes from built-in franchise rules, TMDb collections found in the libraries and the
-/// changes made by administrators (stored in metauniverses.json in the data folder).
+/// changes made by administrators (stored in metauniverses.json in the data folder). They are prepared by a scheduled
+/// task and kept in a file, so opening them never waits for a build.
 /// </summary>
-public sealed partial class MetaUniverseService : IMetaUniverseService
+public sealed partial class MetaUniverseService : IMetaUniverseService, IDisposable
 {
     private const string SourceBuiltin = "builtin";
     private const string SourceAuto = "auto";
     private const string SourceCustom = "custom";
     private const int MinAutoMovies = 3;
-    private static readonly TimeSpan _maxAge = TimeSpan.FromMinutes(30);
-    private static readonly TimeSpan _dirtyDelay = TimeSpan.FromMinutes(2);
+    private const int SnapshotVersion = 1;
+    private const int BatchSize = 500;
+    private const int MaxStoredPeople = 100;
+    private const string KindMovie = "movie";
+    private const string KindSeries = "series";
+    private const string KindAlbum = "album";
+    private const string KindCollection = "collection";
+    private const string KindOther = "other";
+    private static readonly TimeSpan _maxAge = TimeSpan.FromHours(6);
 
     private static readonly BaseItemKind[] _kinds =
     {
@@ -69,26 +79,34 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
     };
 
     private readonly ILibraryManager _libraryManager;
+    private readonly IUserManager _userManager;
     private readonly ILogger<MetaUniverseService> _logger;
     private readonly string _storePath;
+    private readonly string _snapshotPath;
     private readonly Lock _lock = new();
+    private readonly SemaphoreSlim _buildLock = new(1, 1);
+    private readonly ConcurrentDictionary<(Guid User, DateTime Built), Lazy<HashSet<Guid>>> _visibility = new();
     private readonly ConcurrentDictionary<string, Regex?> _regexCache = new(StringComparer.Ordinal);
 
     private Dictionary<string, MetaUniverseDefinition>? _stored;
-    private Snapshot? _snapshot;
-    private bool _dirty;
+    private volatile Snapshot? _snapshot;
+    private volatile bool _dirty;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="MetaUniverseService"/> class.
     /// </summary>
     /// <param name="libraryManager">The library manager.</param>
+    /// <param name="userManager">The user manager.</param>
     /// <param name="appPaths">The application paths.</param>
     /// <param name="logger">The logger.</param>
-    public MetaUniverseService(ILibraryManager libraryManager, IApplicationPaths appPaths, ILogger<MetaUniverseService> logger)
+    public MetaUniverseService(ILibraryManager libraryManager, IUserManager userManager, IApplicationPaths appPaths, ILogger<MetaUniverseService> logger)
     {
         _libraryManager = libraryManager;
+        _userManager = userManager;
         _logger = logger;
         _storePath = Path.Combine(appPaths.DataPath, "metauniverses.json");
+        _snapshotPath = Path.Combine(appPaths.DataPath, "metauniverses.snapshot.json");
+        _userManager.OnUserUpdated += OnUserUpdated;
         _libraryManager.ItemAdded += OnLibraryChanged;
         _libraryManager.ItemUpdated += OnLibraryChanged;
         _libraryManager.ItemRemoved += OnLibraryChanged;
@@ -98,7 +116,7 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
     public IReadOnlyList<MetaUniverseSummary> GetUniverses(User? user, bool includeHidden)
     {
         var snapshot = GetSnapshot();
-        var visible = new Dictionary<Guid, BaseItem?>();
+        var visible = VisibleIds(user, snapshot);
         var result = new List<MetaUniverseSummary>();
         foreach (var universe in snapshot.Universes)
         {
@@ -107,8 +125,7 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
                 continue;
             }
 
-            var items = Visible(universe.Members, user, visible);
-            var summary = Summarize(universe.Definition, items);
+            var summary = Summarize(universe.Definition, Visible(universe.Members, visible));
             var total = summary.MovieCount + summary.SeriesCount + summary.AlbumCount;
             if (!includeHidden && (total < 2 || summary.MovieCount + summary.SeriesCount == 0))
             {
@@ -127,19 +144,20 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
     /// <inheritdoc />
     public MetaUniverseDetails? GetUniverse(string id, User? user)
     {
-        var universe = GetSnapshot().Universes.FirstOrDefault(u => string.Equals(u.Definition.Id, id, StringComparison.OrdinalIgnoreCase));
+        var snapshot = GetSnapshot();
+        var universe = snapshot.Universes.FirstOrDefault(u => string.Equals(u.Definition.Id, id, StringComparison.OrdinalIgnoreCase));
         if (universe is null)
         {
             return null;
         }
 
-        var items = Visible(universe.Members, user, new Dictionary<Guid, BaseItem?>());
+        var items = Visible(universe.Members, VisibleIds(user, snapshot));
         var def = universe.Definition;
-        var watchable = items.Where(i => i is Movie || i is MediaBrowser.Controller.Entities.TV.Series).ToList();
-        var release = watchable.OrderBy(ReleaseDate).ThenBy(i => i.SortName, StringComparer.Ordinal).Select(i => i.Id).ToList();
+        var watchable = items.Where(IsWatchable).ToList();
+        var release = watchable.OrderBy(When).ThenBy(i => i.SortName, StringComparer.Ordinal).Select(i => i.Id).ToList();
 
-        var byId = watchable.ToDictionary(i => i.Id);
-        var chrono = def.ChronologicalOrder.Where(byId.ContainsKey).Distinct().ToList();
+        var known = watchable.Select(i => i.Id).ToHashSet();
+        var chrono = def.ChronologicalOrder.Where(known.Contains).Distinct().ToList();
         var hasChronology = chrono.Count > 0;
         chrono.AddRange(release.Where(i => !chrono.Contains(i)));
 
@@ -150,13 +168,39 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
             ReleaseOrder = release,
             ChronologicalOrder = chrono,
             HasChronology = hasChronology,
-            MovieIds = items.OfType<Movie>().OrderBy(ReleaseDate).Select(i => i.Id).ToList(),
-            SeriesIds = items.OfType<MediaBrowser.Controller.Entities.TV.Series>().OrderBy(ReleaseDate).Select(i => i.Id).ToList(),
-            AlbumIds = items.OfType<MediaBrowser.Controller.Entities.Audio.MusicAlbum>().OrderBy(ReleaseDate).Select(i => i.Id).ToList(),
-            CollectionIds = items.OfType<MediaBrowser.Controller.Entities.Movies.BoxSet>().OrderBy(i => i.SortName, StringComparer.Ordinal).Select(i => i.Id).ToList(),
-            OtherIds = items.Where(i => i is Book || i is MusicVideo).OrderBy(ReleaseDate).Select(i => i.Id).ToList(),
-            People = GetRecurringPeople(watchable)
+            MovieIds = IdsOf(items, KindMovie),
+            SeriesIds = IdsOf(items, KindSeries),
+            AlbumIds = IdsOf(items, KindAlbum),
+            CollectionIds = items.Where(i => i.Kind == KindCollection).OrderBy(i => i.SortName, StringComparer.Ordinal).Select(i => i.Id).ToList(),
+            OtherIds = IdsOf(items, KindOther),
+            People = RecurringPeople(universe.People, known)
         };
+    }
+
+    /// <inheritdoc />
+    public Task BuildAsync(bool force, IProgress<double> progress, CancellationToken cancellationToken)
+        => Task.Run(
+            () =>
+            {
+                var current = _snapshot ?? LoadSaved();
+                if (force || current is null || _dirty || DateTime.UtcNow - current.Built > _maxAge)
+                {
+                    Rebuild(new Progress<double>(p => progress.Report(p * 0.9)), cancellationToken);
+                }
+
+                PrepareUsers(cancellationToken);
+                progress.Report(100);
+            },
+            cancellationToken);
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        _libraryManager.ItemAdded -= OnLibraryChanged;
+        _libraryManager.ItemUpdated -= OnLibraryChanged;
+        _libraryManager.ItemRemoved -= OnLibraryChanged;
+        _userManager.OnUserUpdated -= OnUserUpdated;
+        _buildLock.Dispose();
     }
 
     /// <inheritdoc />
@@ -203,9 +247,10 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
 
             stored[definition.Id] = definition;
             Persist(stored);
-            _snapshot = null;
-            return definition;
         }
+
+        Rebuild(null, CancellationToken.None);
+        return definition;
     }
 
     /// <inheritdoc />
@@ -220,18 +265,10 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
             }
 
             Persist(stored);
-            _snapshot = null;
-            return true;
         }
-    }
 
-    /// <inheritdoc />
-    public void Invalidate()
-    {
-        lock (_lock)
-        {
-            _snapshot = null;
-        }
+        Rebuild(null, CancellationToken.None);
+        return true;
     }
 
     private static MetaUniverseDefinition Seed(string id, string name, string overview, string[] tags, string[] studios, string[] titles) => new()
@@ -251,8 +288,34 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .ToList();
 
-    private static DateTime ReleaseDate(BaseItem item)
-        => item.PremiereDate ?? (item.ProductionYear is int y && y > 0 ? new DateTime(y, 1, 1, 0, 0, 0, DateTimeKind.Utc) : DateTime.MaxValue);
+    private static DateTime? ReleaseDate(BaseItem item)
+        => item.PremiereDate ?? (item.ProductionYear is int y && y > 0 ? new DateTime(y, 1, 1, 0, 0, 0, DateTimeKind.Utc) : null);
+
+    private static DateTime When(Member member) => member.Release ?? DateTime.MaxValue;
+
+    private static bool IsWatchable(Member member) => member.Kind is KindMovie or KindSeries;
+
+    private static List<Guid> IdsOf(List<Member> items, string kind)
+        => items.Where(i => i.Kind == kind).OrderBy(When).Select(i => i.Id).ToList();
+
+    private static string KindOf(BaseItem item) => item switch
+    {
+        Movie => KindMovie,
+        MediaBrowser.Controller.Entities.TV.Series => KindSeries,
+        MediaBrowser.Controller.Entities.Audio.MusicAlbum => KindAlbum,
+        MediaBrowser.Controller.Entities.Movies.BoxSet => KindCollection,
+        _ => KindOther
+    };
+
+    private static Member ToMember(BaseItem item) => new(
+        item.Id,
+        KindOf(item),
+        ReleaseDate(item),
+        item.SortName ?? string.Empty,
+        item.CommunityRating,
+        item.ProductionYear,
+        item.HasImage(ImageType.Backdrop),
+        item.HasImage(ImageType.Primary));
 
     /// <summary>Lower case, without accents or punctuation, padded with spaces for whole-word "contains".</summary>
     private static string Normalize(string? text)
@@ -297,43 +360,177 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
 
     private void OnLibraryChanged(object? sender, ItemChangeEventArgs e)
     {
-        if (e.Item is Movie or MediaBrowser.Controller.Entities.TV.Series or MediaBrowser.Controller.Entities.Audio.MusicAlbum or MediaBrowser.Controller.Entities.Movies.BoxSet)
+        if (e.Item is Movie or MediaBrowser.Controller.Entities.TV.Series or MediaBrowser.Controller.Entities.Audio.MusicAlbum or MediaBrowser.Controller.Entities.Movies.BoxSet or Book or MusicVideo)
         {
             _dirty = true;
         }
     }
 
-    private Snapshot GetSnapshot()
+    /// <summary>A change of parental rating or library access applies at once.</summary>
+    private void OnUserUpdated(object? sender, GenericEventArgs<User> e)
     {
-        lock (_lock)
+        foreach (var key in _visibility.Keys.Where(k => k.User == e.Argument.Id))
         {
-            var now = DateTime.UtcNow;
-            if (_snapshot is not null
-                && now - _snapshot.Built < _maxAge
-                && !(_dirty && now - _snapshot.Built > _dirtyDelay))
-            {
-                return _snapshot;
-            }
-
-            _dirty = false;
-            try
-            {
-                _snapshot = Build();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error building the meta universes");
-                _snapshot ??= new Snapshot(now, Array.Empty<Universe>());
-            }
-
-            return _snapshot;
+            _visibility.TryRemove(key, out _);
         }
     }
 
-    private Snapshot Build()
+    /// <summary>What is prepared. Only the very first time, with nothing saved yet, it is built here.</summary>
+    private Snapshot GetSnapshot()
+    {
+        if (_snapshot is { } ready)
+        {
+            return ready;
+        }
+
+        if (LoadSaved() is { } saved)
+        {
+            return saved;
+        }
+
+        _buildLock.Wait();
+        try
+        {
+            if (_snapshot is null)
+            {
+                BuildAndKeep(null, CancellationToken.None);
+            }
+
+            return _snapshot ?? new Snapshot(SnapshotVersion, DateTime.UtcNow, new List<Universe>());
+        }
+        finally
+        {
+            _buildLock.Release();
+        }
+    }
+
+    private Snapshot? LoadSaved()
+    {
+        _buildLock.Wait();
+        try
+        {
+            if (_snapshot is null && File.Exists(_snapshotPath))
+            {
+                using var file = File.OpenRead(_snapshotPath);
+                var saved = JsonSerializer.Deserialize<Snapshot>(file, JsonDefaults.Options);
+                _snapshot = saved?.Version == SnapshotVersion ? saved : null;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException or NotSupportedException)
+        {
+            _logger.LogWarning(ex, "The prepared universes could not be read");
+        }
+        finally
+        {
+            _buildLock.Release();
+        }
+
+        return _snapshot;
+    }
+
+    private void Rebuild(IProgress<double>? progress, CancellationToken cancellationToken)
+    {
+        _buildLock.Wait(cancellationToken);
+        try
+        {
+            BuildAndKeep(progress, cancellationToken);
+        }
+        finally
+        {
+            _buildLock.Release();
+        }
+    }
+
+    /// <summary>Whoever opens the universes meanwhile keeps seeing the previous ones.</summary>
+    private void BuildAndKeep(IProgress<double>? progress, CancellationToken cancellationToken)
+    {
+        _dirty = false;
+        try
+        {
+            var built = Build(progress, cancellationToken);
+            _snapshot = built;
+            _visibility.Clear();
+            SaveSnapshot(built);
+        }
+        catch (OperationCanceledException)
+        {
+            _dirty = true;
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _dirty = true;
+            _logger.LogError(ex, "Error building the meta universes");
+        }
+    }
+
+    private void SaveSnapshot(Snapshot snapshot)
+    {
+        try
+        {
+            var temp = _snapshotPath + ".tmp";
+            using (var file = File.Create(temp))
+            {
+                JsonSerializer.Serialize(file, snapshot, JsonDefaults.Options);
+            }
+
+            File.Move(temp, _snapshotPath, true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            _logger.LogWarning(ex, "The prepared universes could not be saved");
+        }
+    }
+
+    /// <summary>Works out what each user can see, so nobody waits for it when opening the universes.</summary>
+    private void PrepareUsers(CancellationToken cancellationToken)
+    {
+        if (_snapshot is not { } snapshot)
+        {
+            return;
+        }
+
+        foreach (var user in _userManager.GetUsers())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            VisibleIds(user, snapshot);
+        }
+    }
+
+    /// <summary>The ids the user can see (null = everything), until the next build or a change of the user.</summary>
+    private HashSet<Guid>? VisibleIds(User? user, Snapshot snapshot)
+    {
+        if (user is null)
+        {
+            return null;
+        }
+
+        return _visibility.GetOrAdd(
+            (user.Id, snapshot.Built),
+            _ => new Lazy<HashSet<Guid>>(() => ComputeVisible(user, snapshot))).Value;
+    }
+
+    private HashSet<Guid> ComputeVisible(User user, Snapshot snapshot)
+    {
+        var result = new HashSet<Guid>();
+        foreach (var chunk in snapshot.Universes.SelectMany(u => u.Members).Select(m => m.Id).Distinct().Chunk(BatchSize))
+        {
+            var items = _libraryManager.GetItemList(new InternalItemsQuery { ItemIds = chunk });
+            result.UnionWith(items.Where(i => i.IsVisibleStandalone(user)).Select(i => i.Id));
+        }
+
+        return result;
+    }
+
+    private Snapshot Build(IProgress<double>? progress, CancellationToken cancellationToken)
     {
         var started = DateTime.UtcNow;
-        var stored = LoadStored();
+        Dictionary<string, MetaUniverseDefinition> stored;
+        lock (_lock)
+        {
+            stored = new Dictionary<string, MetaUniverseDefinition>(LoadStored(), StringComparer.OrdinalIgnoreCase);
+        }
+
         var all = _libraryManager.GetItemList(new InternalItemsQuery
         {
             IncludeItemTypes = _kinds,
@@ -399,9 +596,12 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
 
         var byId = all.ToDictionary(i => i.Id);
         var boxSetChildren = boxSets.ToDictionary(b => b.Id, b => b.GetLinkedChildren().Select(c => c.Id).ToList());
-        var universes = new List<Universe>(definitions.Count);
-        foreach (var def in definitions)
+        var found = new List<(MetaUniverseDefinition Definition, List<Member> Members)>(definitions.Count);
+        for (var index = 0; index < definitions.Count; index++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            progress?.Report(index * 85.0 / definitions.Count);
+            var def = definitions[index];
             var exclude = def.ExcludeIds.ToHashSet();
             var members = new HashSet<Guid>(media.Where(m => !exclude.Contains(m.Id) && Matches(def, m)).Select(m => m.Id));
             foreach (var id in def.IncludeIds)
@@ -457,12 +657,30 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
 
             if (members.Count > 0 || def.Source == SourceCustom)
             {
-                universes.Add(new Universe(def, members.Select(i => byId[i]).ToList()));
+                found.Add((def, members.Select(i => ToMember(byId[i])).ToList()));
             }
         }
 
+        var credits = LoadCredits(found.SelectMany(f => f.Members).Where(IsWatchable).Select(m => m.Id).Distinct(), cancellationToken);
+        var universes = found.Select(f => new Universe(f.Definition, f.Members, BuildPeople(f.Members, credits))).ToList();
+        progress?.Report(100);
         _logger.LogInformation("Meta universes built: {Count} from {Items} items in {Ms} ms", universes.Count, all.Count, (int)(DateTime.UtcNow - started).TotalMilliseconds);
-        return new Snapshot(DateTime.UtcNow, universes);
+        return new Snapshot(SnapshotVersion, DateTime.UtcNow, universes);
+    }
+
+    private Dictionary<Guid, IReadOnlyList<PersonInfo>> LoadCredits(IEnumerable<Guid> ids, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<Guid, IReadOnlyList<PersonInfo>>();
+        foreach (var chunk in ids.Chunk(BatchSize))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            foreach (var (itemId, people) in _libraryManager.GetPeopleByItems(chunk))
+            {
+                result[itemId] = people;
+            }
+        }
+
+        return result;
     }
 
     private static bool ContainsAny(string text, List<string> needles)
@@ -542,39 +760,22 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
         return false;
     }
 
-    private static List<BaseItem> Visible(IReadOnlyList<BaseItem> members, User? user, Dictionary<Guid, BaseItem?> cache)
+    private static List<Member> Visible(IReadOnlyList<Member> members, HashSet<Guid>? visible)
+        => visible is null ? members.ToList() : members.Where(m => visible.Contains(m.Id)).ToList();
+
+    private static MetaUniverseSummary Summarize(MetaUniverseDefinition def, List<Member> items)
     {
-        var result = new List<BaseItem>(members.Count);
-        foreach (var item in members)
-        {
-            if (!cache.TryGetValue(item.Id, out var visible))
-            {
-                visible = user is null || item.IsVisibleStandalone(user) ? item : null;
-                cache[item.Id] = visible;
-            }
-
-            if (visible is not null)
-            {
-                result.Add(visible);
-            }
-        }
-
-        return result;
-    }
-
-    private static MetaUniverseSummary Summarize(MetaUniverseDefinition def, List<BaseItem> items)
-    {
-        var watchable = items.Where(i => i is Movie || i is MediaBrowser.Controller.Entities.TV.Series).ToList();
-        var years = watchable.Select(i => i.ProductionYear).Where(y => y > 0).Select(y => y!.Value).ToList();
-        var byPopularity = watchable.OrderByDescending(i => i.CommunityRating ?? 0).ToList();
+        var watchable = items.Where(IsWatchable).ToList();
+        var years = watchable.Where(i => i.Year > 0).Select(i => i.Year!.Value).ToList();
+        var byPopularity = watchable.OrderByDescending(i => i.Rating ?? 0).ToList();
 
         var backdrops = new List<Guid>();
-        if (def.BackdropItemId is Guid preferred && items.Any(i => i.Id == preferred && i.HasImage(ImageType.Backdrop)))
+        if (def.BackdropItemId is Guid preferred && items.Any(i => i.Id == preferred && i.HasBackdrop))
         {
             backdrops.Add(preferred);
         }
 
-        backdrops.AddRange(byPopularity.Where(i => i.HasImage(ImageType.Backdrop) && i.Id != def.BackdropItemId).Take(6).Select(i => i.Id));
+        backdrops.AddRange(byPopularity.Where(i => i.HasBackdrop && i.Id != def.BackdropItemId).Take(6).Select(i => i.Id));
 
         return new MetaUniverseSummary
         {
@@ -583,56 +784,80 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
             Overview = def.Overview,
             Source = def.Source,
             Hidden = def.Hidden,
-            MovieCount = items.Count(i => i is Movie),
-            SeriesCount = items.Count(i => i is MediaBrowser.Controller.Entities.TV.Series),
-            AlbumCount = items.Count(i => i is MediaBrowser.Controller.Entities.Audio.MusicAlbum),
-            CollectionCount = items.Count(i => i is MediaBrowser.Controller.Entities.Movies.BoxSet),
+            MovieCount = items.Count(i => i.Kind == KindMovie),
+            SeriesCount = items.Count(i => i.Kind == KindSeries),
+            AlbumCount = items.Count(i => i.Kind == KindAlbum),
+            CollectionCount = items.Count(i => i.Kind == KindCollection),
             FirstYear = years.Count > 0 ? years.Min() : null,
             LastYear = years.Count > 0 ? years.Max() : null,
             BackdropItemIds = backdrops,
-            PosterItemIds = byPopularity.Where(i => i.HasImage(ImageType.Primary)).Take(8).Select(i => i.Id).ToList()
+            PosterItemIds = byPopularity.Where(i => i.HasPrimary).Take(8).Select(i => i.Id).ToList()
         };
     }
 
-    private List<MetaUniversePerson> GetRecurringPeople(List<BaseItem> watchable)
+    /// <summary>The actors of a universe, with the title of each role, to count only what each user can see.</summary>
+    private List<Person> BuildPeople(List<Member> members, Dictionary<Guid, IReadOnlyList<PersonInfo>> credits)
     {
-        if (watchable.Count < 2)
+        var byName = new Dictionary<string, (Guid Id, List<Credit> Credits)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var member in members.Where(IsWatchable))
         {
-            return new List<MetaUniversePerson>();
-        }
+            if (!credits.TryGetValue(member.Id, out var list))
+            {
+                continue;
+            }
 
-        var people = _libraryManager.GetPeopleByItems(watchable.Select(i => i.Id).ToList());
-        var byName = new Dictionary<string, (Guid Id, HashSet<Guid> Items, Dictionary<string, int> Roles)>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (itemId, list) in people)
-        {
             foreach (var person in list.Where(p => p.Type is PersonKind.Actor or PersonKind.GuestStar && !string.IsNullOrWhiteSpace(p.Name)))
             {
                 if (!byName.TryGetValue(person.Name, out var entry))
                 {
-                    entry = (person.Id, new HashSet<Guid>(), new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase));
+                    entry = (person.Id, new List<Credit>());
                     byName[person.Name] = entry;
                 }
 
-                entry.Items.Add(itemId);
-                if (!string.IsNullOrWhiteSpace(person.Role))
-                {
-                    entry.Roles[person.Role.Trim()] = entry.Roles.GetValueOrDefault(person.Role.Trim()) + 1;
-                }
+                entry.Credits.Add(new Credit(member.Id, person.Role?.Trim()));
             }
         }
 
         return byName
-            .Where(p => p.Value.Items.Count >= 2)
-            .OrderByDescending(p => p.Value.Items.Count)
-            .ThenBy(p => p.Key, StringComparer.CurrentCultureIgnoreCase)
-            .Take(30)
-            .Select(p => new MetaUniversePerson
+            .Where(p => p.Value.Credits.Select(c => c.ItemId).Distinct().Skip(1).Any())
+            .OrderByDescending(p => p.Value.Credits.Select(c => c.ItemId).Distinct().Count())
+            .ThenBy(p => p.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(MaxStoredPeople)
+            .Select(p => new Person(p.Value.Id != Guid.Empty ? p.Value.Id : (_libraryManager.GetPerson(p.Key)?.Id ?? Guid.Empty), p.Key, p.Value.Credits))
+            .ToList();
+    }
+
+    private static List<MetaUniversePerson> RecurringPeople(IReadOnlyList<Person> people, HashSet<Guid> visible)
+    {
+        var result = new List<MetaUniversePerson>();
+        foreach (var person in people)
+        {
+            var credits = person.Credits.Where(c => visible.Contains(c.ItemId)).ToList();
+            var appearances = credits.Select(c => c.ItemId).Distinct().Count();
+            if (appearances < 2)
             {
-                Id = p.Value.Id != Guid.Empty ? p.Value.Id : (_libraryManager.GetPerson(p.Key)?.Id ?? Guid.Empty),
-                Name = p.Key,
-                Appearances = p.Value.Items.Count,
-                Roles = p.Value.Roles.OrderByDescending(r => r.Value).Select(r => r.Key).Take(3).ToList()
-            })
+                continue;
+            }
+
+            result.Add(new MetaUniversePerson
+            {
+                Id = person.Id,
+                Name = person.Name,
+                Appearances = appearances,
+                Roles = credits
+                    .Where(c => !string.IsNullOrWhiteSpace(c.Role))
+                    .GroupBy(c => c.Role!, StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(g => g.Count())
+                    .Select(g => g.Key)
+                    .Take(3)
+                    .ToList()
+            });
+        }
+
+        return result
+            .OrderByDescending(p => p.Appearances)
+            .ThenBy(p => p.Name, StringComparer.CurrentCultureIgnoreCase)
+            .Take(30)
             .ToList();
     }
 
@@ -674,7 +899,13 @@ public sealed partial class MetaUniverseService : IMetaUniverseService
         File.Move(temp, _storePath, true);
     }
 
-    private sealed record Universe(MetaUniverseDefinition Definition, IReadOnlyList<BaseItem> Members);
+    private sealed record Member(Guid Id, string Kind, DateTime? Release, string SortName, float? Rating, int? Year, bool HasBackdrop, bool HasPrimary);
 
-    private sealed record Snapshot(DateTime Built, IReadOnlyList<Universe> Universes);
+    private sealed record Credit(Guid ItemId, string? Role);
+
+    private sealed record Person(Guid Id, string Name, List<Credit> Credits);
+
+    private sealed record Universe(MetaUniverseDefinition Definition, List<Member> Members, List<Person> People);
+
+    private sealed record Snapshot(int Version, DateTime Built, List<Universe> Universes);
 }

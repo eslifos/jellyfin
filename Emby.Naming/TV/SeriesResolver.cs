@@ -28,6 +28,13 @@ namespace Emby.Naming.TV
         private static partial Regex TitleWithYearRegex();
 
         /// <summary>
+        /// Regex that matches provider id tags such as "{tvdb-339632}" or "[imdbid-tt7909708]", which are
+        /// read separately and are not part of the name.
+        /// </summary>
+        [GeneratedRegex(@"\s*[\{\[](?:tmdb|tvdb|imdb|tvmaze|anidb|anilist|anisearch)(?:id)?[-=][^\}\]]*[\}\]]", RegexOptions.IgnoreCase)]
+        private static partial Regex ProviderIdTagRegex();
+
+        /// <summary>
         /// Resolve information about series from path.
         /// </summary>
         /// <param name="options"><see cref="NamingOptions"/> object passed to <see cref="SeriesPathParser"/>.</param>
@@ -35,7 +42,7 @@ namespace Emby.Naming.TV
         /// <returns>SeriesInfo.</returns>
         public static SeriesInfo Resolve(NamingOptions options, string path)
         {
-            string seriesName = Path.GetFileName(path);
+            string seriesName = ProviderIdTagRegex().Replace(Path.GetFileName(path), string.Empty).Trim();
 
             // First check if the filename matches a title with year pattern (handles numeric titles)
             if (!string.IsNullOrEmpty(seriesName))
@@ -63,6 +70,7 @@ namespace Emby.Naming.TV
 
             if (!string.IsNullOrEmpty(seriesName))
             {
+                seriesName = ProviderIdTagRegex().Replace(seriesName, string.Empty);
                 seriesName = SeriesNameRegex().Replace(seriesName, " ").Trim();
             }
 

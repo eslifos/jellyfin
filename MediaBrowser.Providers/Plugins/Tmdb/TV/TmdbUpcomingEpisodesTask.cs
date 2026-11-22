@@ -124,6 +124,9 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // Library scans skip series checked recently; this task checks every one of them
+                TmdbMissingEpisodeCheckStore.Forget(series[i].Id);
+
                 try
                 {
                     await series[i].ValidateChildren(new Progress<double>(), refreshOptions, cancellationToken: cancellationToken).ConfigureAwait(false);

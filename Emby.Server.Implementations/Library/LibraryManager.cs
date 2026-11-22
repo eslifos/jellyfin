@@ -456,6 +456,17 @@ namespace Emby.Server.Implementations.Library
                     item.Name ?? "Unknown name",
                     item.Path ?? string.Empty,
                     item.Id);
+
+                // Shown in the dashboard live log; the library is looked up now, while the item still exists
+                if (item is not Folder { IsTopParent: true })
+                {
+                    LibraryActivity.Note(
+                        item,
+                        LibraryActivityKind.Removed,
+                        GetActivityTitle(item),
+                        item.Path,
+                        GetCollectionFolders(item).FirstOrDefault()?.Name);
+                }
             }
 
             // If deleting a primary version video, clear PrimaryVersionId from alternate versions
@@ -1507,6 +1518,32 @@ namespace Emby.Server.Implementations.Library
             progress.Report(100);
         }
 
+        /// <summary>Readable title of an item for the dashboard live log (series and season for episodes).</summary>
+        private static string? GetActivityTitle(BaseItem item) => item switch
+        {
+            Episode e when !string.IsNullOrEmpty(e.SeriesName) => e.SeriesName + " · " + (e.ParentIndexNumber is int s && e.IndexNumber is int n ? "T" + s + "E" + n + " · " : string.Empty) + e.Name,
+            MediaBrowser.Controller.Entities.TV.Season s when !string.IsNullOrEmpty(s.SeriesName) => s.SeriesName + " · " + s.Name,
+            _ => item.Name
+        };
+
+        /// <summary>Readable name of a post-scan task for the dashboard.</summary>
+        private static string GetPostScanTaskTitle(string taskName) => taskName switch
+        {
+            "PeopleValidationTask" or "PeopleValidator" => "Validando personas",
+            "ArtistsPostScanTask" => "Validando artistas",
+            "GenresPostScanTask" => "Validando géneros",
+            "MusicGenresPostScanTask" => "Validando géneros musicales",
+            "StudiosPostScanTask" => "Validando estudios",
+            "CollectionPostScanTask" => "Actualizando colecciones",
+            "CollectionPosterVerifyPostScanTask" => "Verificando pósters de bibliotecas",
+            "CollectionCoversPostScanTask" => "Creando portadas de colecciones",
+            "CleanDatabaseScheduledTask" => "Limpiando la base de datos",
+            "RefreshDatabaseStatisticsPostScanTask" => "Actualizando estadísticas",
+            "SplashscreenPostScanTask" => "Generando pantalla de inicio",
+            "ChannelPostScanTask" => "Actualizando canales",
+            _ => taskName
+        };
+
         /// <summary>
         /// Runs the post scan tasks.
         /// </summary>
@@ -1549,6 +1586,9 @@ namespace Emby.Server.Implementations.Library
                     currentNumComplete + 1,
                     numTasks,
                     taskName);
+
+                // Shown live in the dashboard
+                using var postScanActivity = LibraryActivity.Begin(GetPostScanTaskTitle(taskName), LibraryActivityKind.PostScan);
 
                 try
                 {
@@ -1797,6 +1837,20 @@ namespace Emby.Server.Implementations.Library
             }
 
             return _countService.GetItemCounts(query);
+        }
+
+        public ItemFileTotals GetFileTotals(InternalItemsQuery query)
+        {
+            if (query.Recursive && !query.ParentId.IsEmpty())
+            {
+                var parent = GetItemById(query.ParentId);
+                if (parent is not null)
+                {
+                    SetTopParentIdsOrAncestors(query, [parent]);
+                }
+            }
+
+            return _countService.GetFileTotals(query);
         }
 
         /// <inheritdoc/>
@@ -2449,6 +2503,13 @@ namespace Emby.Server.Implementations.Library
             // This ensures they exist in the database when LinkedChildren are processed
             var allItems = new List<BaseItem>(items);
             var parentFolder = parent as Folder;
+
+            // Shown in the dashboard live log
+            foreach (var added in items)
+            {
+                LibraryActivity.Note(added, LibraryActivityKind.Added, GetActivityTitle(added), added.Path);
+            }
+
             var parentCollectionType = parent is not null ? GetTopFolderContentType(parent) : null;
             foreach (var item in items)
             {

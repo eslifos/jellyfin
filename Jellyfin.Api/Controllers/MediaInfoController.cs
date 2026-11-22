@@ -3,6 +3,7 @@ using System.Buffers;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Net.Mime;
+using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Api.Attributes;
 using Jellyfin.Api.Extensions;
@@ -13,6 +14,9 @@ using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Devices;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Model.Dlna;
+using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -35,6 +39,7 @@ public class MediaInfoController : BaseJellyfinApiController
     private readonly ILogger<MediaInfoController> _logger;
     private readonly MediaInfoHelper _mediaInfoHelper;
     private readonly IUserManager _userManager;
+    private readonly ISubtitleEncoder _subtitleEncoder;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="MediaInfoController"/> class.
@@ -45,13 +50,15 @@ public class MediaInfoController : BaseJellyfinApiController
     /// <param name="logger">Instance of the <see cref="ILogger{MediaInfoController}"/> interface.</param>
     /// <param name="mediaInfoHelper">Instance of the <see cref="MediaInfoHelper"/>.</param>
     /// <param name="userManager">Instance of the <see cref="IUserManager"/> interface..</param>
+    /// <param name="subtitleEncoder">Instance of the <see cref="ISubtitleEncoder"/> interface.</param>
     public MediaInfoController(
         IMediaSourceManager mediaSourceManager,
         IDeviceManager deviceManager,
         ILibraryManager libraryManager,
         ILogger<MediaInfoController> logger,
         MediaInfoHelper mediaInfoHelper,
-        IUserManager userManager)
+        IUserManager userManager,
+        ISubtitleEncoder subtitleEncoder)
     {
         _mediaSourceManager = mediaSourceManager;
         _deviceManager = deviceManager;
@@ -59,6 +66,7 @@ public class MediaInfoController : BaseJellyfinApiController
         _logger = logger;
         _mediaInfoHelper = mediaInfoHelper;
         _userManager = userManager;
+        _subtitleEncoder = subtitleEncoder;
     }
 
     /// <summary>
@@ -215,6 +223,7 @@ public class MediaInfoController : BaseJellyfinApiController
             }
 
             _mediaInfoHelper.SortMediaSources(info, maxStreamingBitrate, item.Id);
+            StartSubtitleExtraction(info, mediaSourceId);
         }
 
         if (autoOpenLiveStream.Value)
@@ -247,6 +256,25 @@ public class MediaInfoController : BaseJellyfinApiController
         }
 
         return info;
+    }
+
+    /// <summary>
+    /// Subtitles inside the video file must be read out of it before the player can show them. That starts now, while
+    /// the player is still loading the video, so the first lines are ready when the picture appears.
+    /// </summary>
+    private void StartSubtitleExtraction(PlaybackInfoResponse info, string? mediaSourceId)
+    {
+        var source = string.IsNullOrEmpty(mediaSourceId)
+            ? info.MediaSources.FirstOrDefault()
+            : info.MediaSources.FirstOrDefault(i => string.Equals(i.Id, mediaSourceId, StringComparison.Ordinal));
+        var subtitle = source?.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Subtitle && i.Index == source.DefaultSubtitleStreamIndex);
+        if (source is null
+            || subtitle is not { IsExternal: false, IsTextSubtitleStream: true, DeliveryMethod: SubtitleDeliveryMethod.External })
+        {
+            return;
+        }
+
+        _ = Task.Run(() => _subtitleEncoder.ExtractAllExtractableSubtitles(source, CancellationToken.None), CancellationToken.None);
     }
 
     /// <summary>

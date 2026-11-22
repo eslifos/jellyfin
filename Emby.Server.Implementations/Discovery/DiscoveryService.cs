@@ -2,7 +2,9 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
@@ -29,7 +31,8 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
 {
     private static readonly TimeSpan _heroMaxAge = TimeSpan.FromHours(3);
     private static readonly TimeSpan _upcomingMaxAge = TimeSpan.FromHours(12);
-    private static readonly TimeSpan _upcomingDirtyDelay = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan _upcomingDirtyDelay = TimeSpan.FromHours(1);
+    private static readonly TimeSpan _firstBuildWait = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan _popularityMaxAge = TimeSpan.FromHours(24);
     private const int TmdbLookups = 40;
 
@@ -38,8 +41,10 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     private readonly IImdbRatingsService _imdb;
     private readonly IServerConfigurationManager _config;
     private readonly ILogger<DiscoveryService> _logger;
-    private readonly SemaphoreSlim _heroLock = new(1, 1);
-    private readonly SemaphoreSlim _upcomingLock = new(1, 1);
+    private readonly CancellationTokenSource _stopping = new();
+    private readonly object _buildsLock = new();
+    private readonly Dictionary<string, Task> _builds = new(StringComparer.Ordinal);
+    private int _savedLoaded;
     private readonly ConcurrentDictionary<string, (DateTime At, double? Popularity)> _popularity = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<Guid, int?> _seriesTmdb = new();
     private volatile bool _upcomingDirty;
@@ -48,6 +53,12 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     private (DateTime Built, List<UpcomingRelease> Releases)? _upcoming;
     private readonly ConcurrentDictionary<string, (DateTime Built, LibraryDiscovery Rows)> _libraryRows = new(StringComparer.Ordinal);
     private static readonly TimeSpan _libraryMaxAge = TimeSpan.FromMinutes(30);
+    private readonly ConcurrentDictionary<string, (DateTime Built, List<Guid> Ids)> _top10 = new(StringComparer.Ordinal);
+    // Loading a whole library is heavy: while a scan adds titles, the list is rebuilt at most this often
+    private static readonly TimeSpan _top10RebuildDelay = TimeSpan.FromMinutes(15);
+    private DateTime _top10ChangedAt = DateTime.MinValue;
+    private readonly object _top10SettingsLock = new();
+    private Top10Settings? _top10Settings;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DiscoveryService"/> class.
@@ -72,28 +83,7 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     /// <inheritdoc />
     public async Task<IReadOnlyList<HeroPick>> GetHeroAsync(User user, int limit, CancellationToken cancellationToken)
     {
-        var picks = _hero is { } cached && DateTime.UtcNow - cached.Built < _heroMaxAge ? cached.Picks : null;
-        if (picks is null)
-        {
-            await _heroLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                if (_hero is { } again && DateTime.UtcNow - again.Built < _heroMaxAge)
-                {
-                    picks = again.Picks;
-                }
-                else
-                {
-                    picks = await BuildHeroAsync(cancellationToken).ConfigureAwait(false);
-                    _hero = (DateTime.UtcNow, picks);
-                }
-            }
-            finally
-            {
-                _heroLock.Release();
-            }
-        }
-
+        var picks = await GetHeroPicksAsync(cancellationToken).ConfigureAwait(false);
         return picks
             .Where(p => _libraryManager.GetItemById(p.ItemId) is { } item && item.IsVisibleStandalone(user))
             .Take(Math.Clamp(limit, 1, 30))
@@ -101,31 +91,35 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<UpcomingRelease>> GetUpcomingAsync(User user, DateTime from, DateTime to, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<HeroPick>> GetHeroPicksAsync(CancellationToken cancellationToken)
     {
-        var releases = _upcoming is { } cached && IsUpcomingFresh(cached.Built) ? cached.Releases : null;
-        if (releases is null)
+        LoadSaved();
+        var cached = _hero;
+        List<HeroPick> picks;
+        if (cached is { } fresh && DateTime.UtcNow - fresh.Built < _heroMaxAge)
         {
-            await _upcomingLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
+            picks = fresh.Picks;
+        }
+        else
+        {
+            // Built in the background (leaving the page does not cancel it); meanwhile the previous picks are shown
+            var build = Shared("hero", async ct =>
             {
-                if (_upcoming is { } again && IsUpcomingFresh(again.Built))
-                {
-                    releases = again.Releases;
-                }
-                else
-                {
-                    _upcomingDirty = false;
-                    releases = await BuildUpcomingAsync(cancellationToken).ConfigureAwait(false);
-                    _upcoming = (DateTime.UtcNow, releases);
-                }
-            }
-            finally
-            {
-                _upcomingLock.Release();
-            }
+                var built = await BuildHeroAsync(ct).ConfigureAwait(false);
+                _hero = (DateTime.UtcNow, built);
+                Save("hero", _hero.Value.Built, built);
+                return built;
+            });
+            picks = cached?.Picks ?? await build.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        return picks;
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<UpcomingRelease>> GetUpcomingAsync(User user, DateTime from, DateTime to, CancellationToken cancellationToken)
+    {
+        var releases = await GetUpcomingAllAsync(from, to, cancellationToken).ConfigureAwait(false);
         var visible = new Dictionary<Guid, bool>();
         bool IsVisible(Guid? id)
         {
@@ -143,21 +137,85 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
             return ok;
         }
 
-        return releases
-            .Where(r => r.ReleaseDate >= from && r.ReleaseDate <= to)
-            .Where(r => IsVisible(r.Kind == "Episode" ? r.SeriesId : r.RelatedItemId))
-            .ToList();
+        return releases.Where(r => IsVisible(r.Kind == "Episode" ? r.SeriesId : r.RelatedItemId)).ToList();
     }
 
     /// <inheritdoc />
-    public async Task<LibraryDiscovery> GetLibraryAsync(User user, Guid parentId, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<UpcomingRelease>> GetUpcomingAllAsync(DateTime from, DateTime to, CancellationToken cancellationToken)
     {
-        var key = user.Id.ToString("N", CultureInfo.InvariantCulture) + parentId.ToString("N", CultureInfo.InvariantCulture);
-        if (_libraryRows.TryGetValue(key, out var cached) && DateTime.UtcNow - cached.Built < _libraryMaxAge)
+        LoadSaved();
+        var cached = _upcoming;
+        List<UpcomingRelease> releases;
+        if (cached is { } fresh && IsUpcomingFresh(fresh.Built))
+        {
+            releases = fresh.Releases;
+        }
+        else
+        {
+            // Thousands of TMDb lookups: built in the background, the home screen never waits for it
+            var build = Shared("upcoming", async ct =>
+            {
+                _upcomingDirty = false;
+                var built = await BuildUpcomingAsync(ct).ConfigureAwait(false);
+                _upcoming = (DateTime.UtcNow, built);
+                Save("upcoming", _upcoming.Value.Built, built);
+                return built;
+            });
+
+            if (cached is { } stale)
+            {
+                releases = stale.Releases;
+            }
+            else
+            {
+                try
+                {
+                    releases = await build.WaitAsync(_firstBuildWait, cancellationToken).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    return [];
+                }
+            }
+        }
+
+        return releases.Where(r => r.ReleaseDate >= from && r.ReleaseDate <= to).ToList();
+    }
+
+    /// <inheritdoc />
+    public async Task<LibraryDiscovery> GetLibraryAsync(User user, Guid parentId, string? theme, CancellationToken cancellationToken)
+    {
+        theme = theme?.ToLowerInvariant() is "anime" or "kids" ? theme.ToLowerInvariant() : null;
+        var key = user.Id.ToString("N", CultureInfo.InvariantCulture) + parentId.ToString("N", CultureInfo.InvariantCulture) + theme;
+        var found = _libraryRows.TryGetValue(key, out var cached);
+        if (found && DateTime.UtcNow - cached.Built < _libraryMaxAge)
         {
             return cached.Rows;
         }
 
+        var build = Shared("library" + key, ct => BuildLibraryAsync(user, parentId, theme, key, ct));
+        return found ? cached.Rows : await build.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether a movie in theaters or coming soon suits the library: anime is Japanese animation, kids is
+    /// animation or family; other libraries take every movie.
+    /// </summary>
+    private static bool SuitsTheme(TMDbLib.Objects.Search.SearchMovie movie, string? theme)
+    {
+        const int Animation = 16;
+        const int Family = 10751;
+        var genres = movie.GenreIds ?? [];
+        return theme switch
+        {
+            "anime" => genres.Contains(Animation) && string.Equals(movie.OriginalLanguage, "ja", StringComparison.OrdinalIgnoreCase),
+            "kids" => (genres.Contains(Animation) || genres.Contains(Family)) && !movie.Adult,
+            _ => true
+        };
+    }
+
+    private async Task<LibraryDiscovery> BuildLibraryAsync(User user, Guid parentId, string? theme, string key, CancellationToken cancellationToken)
+    {
         if (_libraryManager.GetItemById(parentId) is not Folder library)
         {
             return new LibraryDiscovery();
@@ -205,8 +263,10 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
         var day = await List("trending-day", 5).ConfigureAwait(false);
         var week = await List("trending-week", 5).ConfigureAwait(false);
         var popular = await List("popular", 5).ConfigureAwait(false);
-        var upcoming = await List("upcoming", 3).ConfigureAwait(false);
-        var nowPlaying = await List("now-playing", 3).ConfigureAwait(false);
+        // Anime and kids keep only their kind of movies, so more pages are read to find enough of them
+        var pages = theme is null ? 3 : 8;
+        var upcoming = (await List("upcoming", pages).ConfigureAwait(false)).Where(m => SuitsTheme(m, theme)).ToList();
+        var nowPlaying = (await List("now-playing", pages).ConfigureAwait(false)).Where(m => SuitsTheme(m, theme)).ToList();
 
         // Top 10: what people watch right now (trending this week and today, and popular), best ranked first
         var heat = new Dictionary<Guid, double>();
@@ -247,6 +307,13 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
                 .OrderByDescending(m => Math.Log10(1 + (ratings.GetValueOrDefault(m.Id)?.Votes ?? 0)) * Weighted(m, 5000))
                 .Select(m => m.Id)
                 .Take(10 - top10.Count));
+        }
+
+        var top10Settings = GetTop10Settings();
+        if (top10Settings.MoviesManual)
+        {
+            var inLibrary = movies.Select(m => m.Id).ToHashSet();
+            top10 = top10Settings.Movies.Where(inLibrary.Contains).Take(10).ToList();
         }
 
         var trending = day.Concat(week)
@@ -298,6 +365,7 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
         var rows = new LibraryDiscovery
         {
             Top10 = top10,
+            Top10Manual = top10Settings.MoviesManual,
             Trending = trending,
             TopRated = topRated,
             HiddenGems = gems,
@@ -318,6 +386,259 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
 
         _libraryRows[key] = (DateTime.UtcNow, rows);
         return rows;
+    }
+
+    /// <inheritdoc />
+    public Top10Settings GetTop10Settings()
+    {
+        lock (_top10SettingsLock)
+        {
+            if (_top10Settings is not null)
+            {
+                return _top10Settings;
+            }
+
+            try
+            {
+                if (File.Exists(Top10SettingsPath))
+                {
+                    _top10Settings = JsonSerializer.Deserialize<Top10Settings>(File.ReadAllText(Top10SettingsPath));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Top 10 settings could not be read");
+            }
+
+            return _top10Settings ??= new Top10Settings();
+        }
+    }
+
+    /// <inheritdoc />
+    public void SaveTop10Settings(Top10Settings settings)
+    {
+        var clean = new Top10Settings
+        {
+            MoviesManual = settings.MoviesManual,
+            SeriesManual = settings.SeriesManual,
+            Movies = (settings.Movies ?? []).Where(id => !id.Equals(Guid.Empty)).Distinct().Take(10).ToArray(),
+            Series = (settings.Series ?? []).Where(id => !id.Equals(Guid.Empty)).Distinct().Take(10).ToArray()
+        };
+
+        lock (_top10SettingsLock)
+        {
+            File.WriteAllText(Top10SettingsPath, JsonSerializer.Serialize(clean));
+            _top10Settings = clean;
+        }
+
+        // Rebuild the rows with the new choice
+        _top10.Clear();
+        _libraryRows.Clear();
+    }
+
+    private string Top10SettingsPath => Path.Combine(_config.ApplicationPaths.DataPath, "top10.json");
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<Guid>> GetTop10Async(User user, bool series, bool automatic, Guid? parentId, CancellationToken cancellationToken)
+    {
+        Folder? library = null;
+        if (parentId is Guid libraryId && !libraryId.Equals(Guid.Empty))
+        {
+            library = _libraryManager.GetItemById(libraryId) as Folder;
+            if (library is null)
+            {
+                return [];
+            }
+        }
+
+        var settings = GetTop10Settings();
+        if (!automatic && (series ? settings.SeriesManual : settings.MoviesManual))
+        {
+            // Picked by hand: as chosen, skipping what this user cannot see (or what is in another library)
+            HashSet<Guid>? inLibrary = library is null ? null : library.GetItemList(new InternalItemsQuery(user)
+            {
+                IncludeItemTypes = [series ? BaseItemKind.Series : BaseItemKind.Movie],
+                Recursive = true,
+                IsVirtualItem = false
+            }).Select(i => i.Id).ToHashSet();
+
+            return (series ? settings.Series : settings.Movies)
+                .Where(id => inLibrary is null || inLibrary.Contains(id))
+                .Select(id => _libraryManager.GetItemById(id))
+                .Where(i => i is not null && i.IsVisibleStandalone(user))
+                .Select(i => i!.Id)
+                .Take(10)
+                .ToList();
+        }
+
+        // One list per library for everybody (loading the whole library is the heavy part); each user then
+        // only gets the titles they can see
+        var ids = await GetAutomaticTop10Async(series, library, cancellationToken).ConfigureAwait(false);
+        return ids.Where(id => _libraryManager.GetItemById(id) is { } item && item.IsVisibleStandalone(user)).ToList();
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<Guid>> GetTop10IdsAsync(bool series, Guid? libraryId, CancellationToken cancellationToken)
+    {
+        Folder? library = null;
+        if (libraryId is Guid id && !id.Equals(Guid.Empty))
+        {
+            library = _libraryManager.GetItemById(id) as Folder;
+            if (library is null)
+            {
+                return [];
+            }
+        }
+
+        var settings = GetTop10Settings();
+        if (series ? settings.SeriesManual : settings.MoviesManual)
+        {
+            // Picked by hand: as chosen (only the ones of this library)
+            return (series ? settings.Series : settings.Movies)
+                .Select(i => _libraryManager.GetItemById(i))
+                .Where(i => i is not null && (library is null || _libraryManager.GetCollectionFolders(i).Any(f => f.Id.Equals(library.Id))))
+                .Select(i => i!.Id)
+                .Take(10)
+                .ToList();
+        }
+
+        return await GetAutomaticTop10Async(series, library, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<List<Guid>> GetAutomaticTop10Async(bool series, Folder? library, CancellationToken cancellationToken)
+    {
+        var key = (series ? "tv" : "movie") + (library?.Id.ToString("N", CultureInfo.InvariantCulture) ?? string.Empty);
+        var found = _top10.TryGetValue(key, out var cached);
+        if (found && IsTop10Fresh(cached.Built, cached.Ids.Count))
+        {
+            return cached.Ids;
+        }
+
+        // The previous list is shown while the new one is built in the background
+        var build = Shared("top10" + key, ct => BuildTop10Async(series, library, key, ct));
+        return found ? cached.Ids : await build.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<List<Guid>> BuildTop10Async(bool series, Folder? library, string key, CancellationToken cancellationToken)
+    {
+        var language = _config.Configuration.PreferredMetadataLanguage;
+        var country = string.IsNullOrEmpty(_config.Configuration.MetadataCountryCode) ? "US" : _config.Configuration.MetadataCountryCode;
+
+        var query = new InternalItemsQuery
+        {
+            IncludeItemTypes = [series ? BaseItemKind.Series : BaseItemKind.Movie],
+            Recursive = true,
+            IsVirtualItem = false,
+            // Without a user the movies would be folded into their collections
+            CollapseBoxSetItems = false
+        };
+        var items = (library is null ? _libraryManager.GetItemList(query) : library.GetItemList(query))
+            // Only the main version of movies with several copies
+            .Where(m => m is not Video { PrimaryVersionId: not null })
+            .ToList();
+
+        var byTmdb = new Dictionary<int, BaseItem>();
+        var byName = new Dictionary<string, BaseItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in items)
+        {
+            if (TmdbId(item) is int id)
+            {
+                byTmdb.TryAdd(id, item);
+            }
+
+            if (item.ProductionYear is int year && year > 0)
+            {
+                foreach (var name in new[] { item.Name, item.OriginalTitle })
+                {
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        byName.TryAdd(name + "|" + year.ToString(CultureInfo.InvariantCulture), item);
+                    }
+                }
+            }
+        }
+
+        // Titles without TMDb id (series identified by TVDb) are matched by name and year
+        BaseItem? Match(int tmdbId, string? name, string? originalName, DateTime? date)
+        {
+            if (byTmdb.TryGetValue(tmdbId, out var hit))
+            {
+                return hit;
+            }
+
+            if (date is not DateTime d)
+            {
+                return null;
+            }
+
+            var year = "|" + d.Year.ToString(CultureInfo.InvariantCulture);
+            return (name is not null ? byName.GetValueOrDefault(name + year) : null)
+                ?? (originalName is not null ? byName.GetValueOrDefault(originalName + year) : null);
+        }
+
+        var heat = new Dictionary<Guid, double>();
+        void Heat(IReadOnlyList<BaseItem?> list, double weight)
+        {
+            for (var i = 0; i < list.Count; i++)
+            {
+                // Only titles with a poster: an empty card in the top 10 looks broken
+                if (list[i] is { } item && item.HasImage(ImageType.Primary))
+                {
+                    heat[item.Id] = heat.GetValueOrDefault(item.Id) + (weight * (list.Count - i) / list.Count);
+                }
+            }
+        }
+
+        try
+        {
+            foreach (var (list, weight) in new[] { ("trending-week", 1.0), ("trending-day", 0.8), ("popular", 0.5) })
+            {
+                if (series)
+                {
+                    var shows = await _tmdb.GetTvListAsync(list, language, country, 5, cancellationToken).ConfigureAwait(false);
+                    Heat(shows.Select(t => Match(t.Id, t.Name, t.OriginalName, t.FirstAirDate)).ToList(), weight);
+                }
+                else
+                {
+                    var movies = await _tmdb.GetMovieListAsync(list, language, country, 5, cancellationToken).ConfigureAwait(false);
+                    Heat(movies.Select(m => Match(m.Id, m.Title, m.OriginalTitle, m.ReleaseDate)).ToList(), weight);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "TMDb trending lists not available");
+        }
+
+        var top10 = heat.OrderByDescending(h => h.Value).Select(h => h.Key).Take(10).ToList();
+        double Score(BaseItem m) => _imdb.GetRating(m) is { Votes: > 0 } r ? Math.Log10(1 + r.Votes) * r.Rating : (m.CommunityRating ?? 0) * 0.5;
+
+        // Fillers only when they are ready to be shown (with a poster)
+        var ready = items.Where(m => m.HasImage(ImageType.Primary)).ToList();
+        if (top10.Count < 10)
+        {
+            // Not enough trending titles: the most voted recent titles
+            var recent = DateTime.UtcNow.AddYears(-3);
+            top10.AddRange(ready
+                .Where(m => !top10.Contains(m.Id) && (m.PremiereDate ?? DateTime.MinValue) >= recent)
+                .OrderByDescending(Score)
+                .Select(m => m.Id)
+                .Take(10 - top10.Count));
+        }
+
+        if (top10.Count < 10)
+        {
+            // Libraries of older titles (anime, classics…): the best rated of any year, then the newest additions
+            top10.AddRange(ready
+                .Where(m => !top10.Contains(m.Id))
+                .OrderByDescending(Score)
+                .ThenByDescending(m => m.DateCreated)
+                .Select(m => m.Id)
+                .Take(10 - top10.Count));
+        }
+
+        _top10[key] = (DateTime.UtcNow, top10);
+        return top10;
     }
 
     /// <inheritdoc />
@@ -427,8 +748,110 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
         _libraryManager.ItemAdded -= OnLibraryChanged;
         _libraryManager.ItemUpdated -= OnLibraryChanged;
         _libraryManager.ItemRemoved -= OnLibraryChanged;
-        _heroLock.Dispose();
-        _upcomingLock.Dispose();
+        _stopping.Cancel();
+        _stopping.Dispose();
+    }
+
+    /// <summary>
+    /// Runs one build per key at a time, detached from the request: when the page is left the work goes on
+    /// and the next visit gets the result instead of starting again.
+    /// </summary>
+    private Task<T> Shared<T>(string key, Func<CancellationToken, Task<T>> build)
+    {
+        lock (_buildsLock)
+        {
+            if (_builds.TryGetValue(key, out var running))
+            {
+                return (Task<T>)running;
+            }
+
+            var task = Run();
+            _builds[key] = task;
+            return task;
+        }
+
+        async Task<T> Run()
+        {
+            await Task.Yield();
+            try
+            {
+                return await build(_stopping.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Home list {Key} could not be built", key);
+                throw;
+            }
+            finally
+            {
+                lock (_buildsLock)
+                {
+                    _builds.Remove(key);
+                }
+            }
+        }
+    }
+
+    private string SavedPath(string name) => Path.Combine(_config.ApplicationPaths.CachePath, "discovery", name + ".json");
+
+    /// <summary>The banner and upcoming releases of the last run, so a restart shows them right away.</summary>
+    private void LoadSaved()
+    {
+        if (Interlocked.Exchange(ref _savedLoaded, 1) == 1)
+        {
+            return;
+        }
+
+        if (Read<HeroPick>("hero") is { } hero)
+        {
+            _hero ??= hero;
+        }
+
+        if (Read<UpcomingRelease>("upcoming") is { } upcoming)
+        {
+            _upcoming ??= upcoming;
+        }
+
+        (DateTime Built, List<T> Items)? Read<T>(string name)
+        {
+            try
+            {
+                var path = SavedPath(name);
+                if (!File.Exists(path))
+                {
+                    return null;
+                }
+
+                var saved = JsonSerializer.Deserialize<SavedList<T>>(File.ReadAllText(path));
+                return saved?.Items is { } items ? (saved.Built, items) : null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Saved home list {Name} could not be read", name);
+                return null;
+            }
+        }
+    }
+
+    private void Save<T>(string name, DateTime built, List<T> items)
+    {
+        try
+        {
+            var path = SavedPath(name);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, JsonSerializer.Serialize(new SavedList<T> { Built = built, Items = items }));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Home list {Name} could not be saved", name);
+        }
+    }
+
+    private sealed class SavedList<T>
+    {
+        public DateTime Built { get; set; }
+
+        public List<T>? Items { get; set; }
     }
 
     private static int? TmdbId(BaseItem item)
@@ -441,10 +864,26 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
         return age < _upcomingMaxAge && !(_upcomingDirty && age > _upcomingDirtyDelay);
     }
 
+    /// <summary>
+    /// A full top 10 lasts the usual time; an incomplete one, or one built before titles were added or got
+    /// their images, is rebuilt after a short delay so new titles show up while the library is scanned.
+    /// </summary>
+    private bool IsTop10Fresh(DateTime built, int count)
+    {
+        var age = DateTime.UtcNow - built;
+        if (age >= _libraryMaxAge)
+        {
+            return false;
+        }
+
+        return age < _top10RebuildDelay || (count >= 10 && built >= _top10ChangedAt);
+    }
+
     private void OnLibraryChanged(object? sender, ItemChangeEventArgs e)
     {
         if (e.Item is Series or Movie)
         {
+            _top10ChangedAt = DateTime.UtcNow;
             _upcomingDirty = true;
             if (e.Item is Series)
             {

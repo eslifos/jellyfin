@@ -26,6 +26,7 @@ using MediaBrowser.Model.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Api.Controllers;
 
@@ -41,6 +42,7 @@ public class LibraryStructureController : BaseJellyfinApiController
     private readonly ILibraryMonitor _libraryMonitor;
     private readonly IDirectoryService _directoryService;
     private readonly IUserManager _userManager;
+    private readonly ILogger<LibraryStructureController> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="LibraryStructureController"/> class.
@@ -50,13 +52,16 @@ public class LibraryStructureController : BaseJellyfinApiController
     /// <param name="libraryMonitor">Instance of <see cref="ILibraryMonitor"/> interface.</param>
     /// <param name="directoryService">Instance of <see cref="IDirectoryService"/> interface.</param>
     /// <param name="userManager">Instance of <see cref="IUserManager"/> interface.</param>
+    /// <param name="logger">Instance of <see cref="ILogger{LibraryStructureController}"/> interface.</param>
     public LibraryStructureController(
         IServerConfigurationManager serverConfigurationManager,
         ILibraryManager libraryManager,
         ILibraryMonitor libraryMonitor,
         IDirectoryService directoryService,
-        IUserManager userManager)
+        IUserManager userManager,
+        ILogger<LibraryStructureController> logger)
     {
+        _logger = logger;
         _appPaths = serverConfigurationManager.ApplicationPaths;
         _libraryManager = libraryManager;
         _libraryMonitor = libraryMonitor;
@@ -362,6 +367,7 @@ public class LibraryStructureController : BaseJellyfinApiController
     /// </summary>
     /// <param name="name">The name of the library.</param>
     /// <param name="collectionType">The new type.</param>
+    /// <param name="theme">For mixed libraries: "anime" or "kids" (any other value removes the theme).</param>
     /// <response code="204">Type changed.</response>
     /// <response code="400">The type cannot be used for a library.</response>
     /// <response code="404">Library doesn't exist.</response>
@@ -372,7 +378,8 @@ public class LibraryStructureController : BaseJellyfinApiController
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult> UpdateCollectionType(
         [FromQuery, Required] string name,
-        [FromQuery, Required] CollectionTypeOptions collectionType)
+        [FromQuery, Required] CollectionTypeOptions collectionType,
+        [FromQuery] string? theme = null)
     {
         if (collectionType == CollectionTypeOptions.boxsets)
         {
@@ -400,6 +407,11 @@ public class LibraryStructureController : BaseJellyfinApiController
             var typeFile = Path.Combine(path, collectionType.ToString().ToLowerInvariant() + ".collection");
             await System.IO.File.WriteAllBytesAsync(typeFile, []).ConfigureAwait(false);
             _directoryService.Invalidate(path);
+
+            // Anime and kids libraries are mixed libraries with a theme
+            var libraryOptions = CollectionFolder.GetLibraryOptions(path);
+            libraryOptions.ContentTheme = NormalizeTheme(collectionType, theme);
+            CollectionFolder.SaveLibraryOptions(path, libraryOptions);
 
             if (library is not null && library.CollectionType != newType)
             {
@@ -430,6 +442,16 @@ public class LibraryStructureController : BaseJellyfinApiController
         return NoContent();
     }
 
+    /// <summary>Anime and kids are mixed libraries with a theme; audiobooks are books libraries with a theme.</summary>
+    private static string? NormalizeTheme(CollectionTypeOptions collectionType, string? theme)
+        => (collectionType, theme?.Trim().ToLowerInvariant()) switch
+        {
+            (CollectionTypeOptions.mixed, "anime") => "anime",
+            (CollectionTypeOptions.mixed, "kids") => "kids",
+            (CollectionTypeOptions.books, "audiobooks") => "audiobooks",
+            _ => null
+        };
+
     /// <summary>
     /// Add a media path to a library.
     /// </summary>
@@ -446,28 +468,28 @@ public class LibraryStructureController : BaseJellyfinApiController
     {
         _libraryMonitor.Stop();
 
+        MediaPathInfo? mediaPath = null;
         try
         {
-            var mediaPath = mediaPathDto.PathInfo ?? new MediaPathInfo(mediaPathDto.Path ?? throw new ArgumentException("PathInfo and Path can't both be null."));
+            mediaPath = mediaPathDto.PathInfo ?? new MediaPathInfo(mediaPathDto.Path ?? throw new ArgumentException("PathInfo and Path can't both be null."));
 
             _libraryManager.AddMediaPath(mediaPathDto.Name, mediaPath);
         }
         finally
         {
+            var added = mediaPath?.Path;
             Task.Run(async () =>
             {
-                // No need to start if scanning the library because it will handle it
-                if (refreshLibrary)
+                // Only the new folder is registered and read, instead of a scan of every library that could be
+                // queued behind another one, cancelled or lost on a restart
+                if (refreshLibrary && !string.IsNullOrEmpty(added))
                 {
-                    _libraryManager.QueueLibraryScan();
+                    await LibraryFolderReader.ReadAsync(_libraryManager, [added], _logger).ConfigureAwait(false);
                 }
-                else
-                {
-                    // Need to add a delay here or directory watchers may still pick up the changes
-                    // Have to block here to allow exceptions to bubble
-                    await Task.Delay(1000).ConfigureAwait(false);
-                    _libraryMonitor.Start();
-                }
+
+                // Need to add a delay here or directory watchers may still pick up the changes
+                await Task.Delay(1000).ConfigureAwait(false);
+                _libraryMonitor.Start();
             });
         }
 
@@ -561,6 +583,10 @@ public class LibraryStructureController : BaseJellyfinApiController
         }
 
         LibraryOptions options = item.GetLibraryOptions();
+
+        // The options editor does not know the theme (anime / kids): keep it
+        request.LibraryOptions!.ContentTheme ??= options.ContentTheme;
+
         foreach (var mediaPath in request.LibraryOptions!.PathInfos)
         {
             if (options.PathInfos.Any(i => i.Path == mediaPath.Path))

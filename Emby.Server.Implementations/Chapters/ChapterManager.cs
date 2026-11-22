@@ -143,6 +143,9 @@ public class ChapterManager : IChapterManager
 
         var currentImages = GetSavedChapterImages(video, directoryService);
 
+        // Shown live in the dashboard, only once an image is actually extracted
+        LibraryActivity.Entry? chapterActivity = null;
+
         foreach (var chapter in chapters)
         {
             if (chapter.StartPositionTicks >= runtimeTicks)
@@ -157,10 +160,16 @@ public class ChapterManager : IChapterManager
             {
                 if (extractImages)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        chapterActivity?.Dispose();
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
 
                     try
                     {
+                        chapterActivity ??= LibraryActivity.Begin(video, LibraryActivityKind.ChapterImages);
+
                         // Add some time for the first chapter to make sure we don't end up with a black image
                         var time = chapter.StartPositionTicks == 0 ? TimeSpan.FromTicks(Math.Min(_firstChapterTicks, video.RunTimeTicks ?? 0)) : TimeSpan.FromTicks(chapter.StartPositionTicks);
 
@@ -223,6 +232,8 @@ public class ChapterManager : IChapterManager
                 changesMade = true;
             }
         }
+
+        chapterActivity?.Dispose();
 
         if (extractedCount > 0)
         {

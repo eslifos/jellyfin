@@ -389,7 +389,10 @@ public class SessionController : BaseJellyfinApiController
         [FromBody, Required] ClientCapabilitiesDto capabilities)
     {
         var currentSessionId = await RequestHelpers.GetSessionId(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(id))
+
+        // After a server restart the app still sends the id of its old session, which no longer exists:
+        // its current session gets the capabilities instead of a 404
+        if (string.IsNullOrWhiteSpace(id) || !System.Linq.Enumerable.Any(_sessionManager.Sessions, s => string.Equals(s.Id, id, StringComparison.Ordinal)))
         {
             id = currentSessionId;
         }

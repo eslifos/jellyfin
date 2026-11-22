@@ -229,5 +229,13 @@ namespace MediaBrowser.Controller.Providers
         void OnRefreshComplete(BaseItem item);
 
         double? GetRefreshProgress(Guid id);
+
+        /// <summary>
+        /// Stops the scan of a library: drops its queued refreshes and cancels the running ones.
+        /// What was already saved stays; the next scan carries on with the rest.
+        /// </summary>
+        /// <param name="libraryId">The library (collection folder) id.</param>
+        /// <returns>How many refreshes were stopped.</returns>
+        int CancelLibraryRefresh(Guid libraryId) => 0;
     }
 }

@@ -27,6 +27,13 @@ public interface IItemCountService
     ItemCounts GetItemCounts(InternalItemsQuery filter);
 
     /// <summary>
+    /// Gets the count, total size and total runtime of the items matching the filter, in a single database query.
+    /// </summary>
+    /// <param name="filter">The query filter.</param>
+    /// <returns>The totals.</returns>
+    ItemFileTotals GetFileTotals(InternalItemsQuery filter);
+
+    /// <summary>
     /// Gets item counts for a "by-name" item using an optimized query.
     /// </summary>
     /// <param name="kind">The kind of the name item.</param>

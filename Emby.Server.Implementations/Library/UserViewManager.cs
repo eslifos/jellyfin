@@ -331,6 +331,13 @@ namespace Emby.Server.Implementations.Library
                 }
             }
 
+            // In a books library a book in parts (a folder of numbered files) is one book: the newest are
+            // the books, not their parts, which would fill the list with the parts of a single book
+            if (includeItemTypes.Length == 0 && parents.Count == 1 && parents[0] is ICollectionFolder { CollectionType: CollectionType.books })
+            {
+                includeItemTypes = [BaseItemKind.Book, BaseItemKind.AudioBook, BaseItemKind.MusicAlbum];
+            }
+
             MediaType[] mediaTypes = [];
 
             if (includeItemTypes.Length == 0)

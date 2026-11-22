@@ -100,5 +100,6 @@
     "TaskDownloadMissingLyricsDescription": "Decarga letras para canciones",
     "TaskMoveTrickplayImages": "Mover localización de foto vista previa",
     "NotificationOptionApplicationUpdateInstalled": "Aplicación actualización disponible",
-    "CleanupUserDataTask": "Tarea de limpieza de los datos del usuario"
+    "CleanupUserDataTask": "Tarea de limpieza de los datos del usuario",
+    "UserDownloadedItemWithValues": "{0} descargó {1} en {2} para verlo sin conexión"
 }

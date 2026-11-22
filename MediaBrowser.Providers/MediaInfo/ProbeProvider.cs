@@ -329,7 +329,15 @@ namespace MediaBrowser.Providers.MediaInfo
                 FetchShortcutInfo(item);
             }
 
-            return _videoProber.ProbeVideo(item, options, cancellationToken);
+            return ProbeVideoTracked(item, options, cancellationToken);
+        }
+
+        private async Task<ItemUpdateType> ProbeVideoTracked<T>(T item, MetadataRefreshOptions options, CancellationToken cancellationToken)
+            where T : Video
+        {
+            // Shown live in the dashboard while ffprobe reads the file
+            using var activity = LibraryActivity.Begin(item, LibraryActivityKind.Analyzing);
+            return await _videoProber.ProbeVideo(item, options, cancellationToken).ConfigureAwait(false);
         }
 
         private string NormalizeStrmLine(string line)

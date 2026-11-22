@@ -142,7 +142,9 @@ public sealed class LibraryChangedNotifier : IHostedService, IDisposable
             var collectionFolderDict = new Dictionary<string, string>
             {
                 ["ItemId"] = collectionFolder.Id.ToString("N", CultureInfo.InvariantCulture),
-                ["Progress"] = (collectionFolder.GetRefreshProgress() ?? 0).ToString(CultureInfo.InvariantCulture)
+                // No folder of the library is refreshing any more: it finished, so report 100 (not 0, which kept
+                // the dashboard showing a scan stuck at 0 %)
+                ["Progress"] = (collectionFolder.GetRefreshProgress() ?? 100).ToString(CultureInfo.InvariantCulture)
             };
 
             try

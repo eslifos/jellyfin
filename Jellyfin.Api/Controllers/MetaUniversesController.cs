@@ -1,4 +1,7 @@
+using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using Jellyfin.Api.Extensions;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Library;
@@ -83,7 +86,7 @@ public class MetaUniversesController : BaseJellyfinApiController
         {
             return _service.Save(definition);
         }
-        catch (System.ArgumentException ex)
+        catch (ArgumentException ex)
         {
             return BadRequest(ex.Message);
         }
@@ -106,14 +109,14 @@ public class MetaUniversesController : BaseJellyfinApiController
     /// <summary>
     /// Rebuilds the universes from the libraries now.
     /// </summary>
-    /// <response code="204">Rebuild requested.</response>
+    /// <response code="204">Universes rebuilt.</response>
     /// <returns>No content.</returns>
     [HttpPost("Refresh")]
     [Authorize(Policy = Policies.RequiresElevation)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
-    public ActionResult Refresh()
+    public async Task<ActionResult> Refresh()
     {
-        _service.Invalidate();
+        await _service.BuildAsync(true, new Progress<double>(), CancellationToken.None).ConfigureAwait(false);
         return NoContent();
     }
 }

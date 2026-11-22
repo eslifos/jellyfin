@@ -61,5 +61,17 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <param name="cancellationToken">The cancellation token.</param>
         /// <returns>Task.</returns>
         Task ExtractAllExtractableSubtitles(MediaSourceInfo mediaSource, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Gets the part of a text subtitle that is already extracted from the video file, so players can show it
+        /// while the extraction (which reads the whole file) is still running.
+        /// </summary>
+        /// <param name="item">Item to use.</param>
+        /// <param name="mediaSourceId">Media source.</param>
+        /// <param name="subtitleStreamIndex">Subtitle stream to use.</param>
+        /// <param name="outputFormat">Output format to use.</param>
+        /// <param name="cancellationToken">The cancellation token for the operation.</param>
+        /// <returns>The subtitle so far (null when nothing is extracted yet) and whether the extraction is complete.</returns>
+        Task<(Stream Content, bool Complete)> GetPartialSubtitles(BaseItem item, string mediaSourceId, int subtitleStreamIndex, string outputFormat, CancellationToken cancellationToken);
     }
 }

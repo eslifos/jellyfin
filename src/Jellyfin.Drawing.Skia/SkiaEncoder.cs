@@ -768,6 +768,12 @@ public class SkiaEncoder : IImageEncoder
     /// <inheritdoc/>
     public void CreateImageCollage(ImageCollageOptions options, string? libraryName)
     {
+        if (options.Strips)
+        {
+            new StripCollageBuilder(this).BuildStripCollage(options.InputPaths, options.OutputPath, options.Width, options.Height);
+            return;
+        }
+
         double ratio = (double)options.Width / options.Height;
 
         if (ratio >= 1.4)

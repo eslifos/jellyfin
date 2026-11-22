@@ -332,6 +332,19 @@ namespace MediaBrowser.Controller.Entities
             return ValidateChildrenInternal(progress, recursive, true, allowRemoveRoot, metadataRefreshOptions, metadataRefreshOptions.DirectoryService, cancellationToken);
         }
 
+        /// <summary>
+        /// Adds and removes the direct children of this folder from the file system, without going into
+        /// subfolders and without refreshing any metadata. Used to pick up new files quickly.
+        /// </summary>
+        /// <param name="directoryService">The directory service.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>A task.</returns>
+        public Task ValidateDirectChildren(IDirectoryService directoryService, CancellationToken cancellationToken)
+        {
+            Children = null; // invalidate cached children.
+            return ValidateChildrenInternal(new Progress<double>(), false, false, false, null, directoryService, cancellationToken);
+        }
+
         private Dictionary<Guid, BaseItem> GetActualChildrenDictionary()
         {
             var dictionary = new Dictionary<Guid, BaseItem>();
@@ -435,7 +448,15 @@ namespace MediaBrowser.Controller.Entities
                 {
                     // Finish enumeration before mutating the library. An I/O failure, including
                     // one partway through a lazy enumeration, must not look like removed files.
-                    nonCachedChildren = GetNonCachedChildren(directoryService).ToArray();
+                    // Shown live in the dashboard: this folder and the entry inside it being read
+                    using var activity = LibraryActivity.Begin(this, LibraryActivityKind.Scanning);
+                    nonCachedChildren = GetNonCachedChildren(directoryService)
+                        .Select(child =>
+                        {
+                            activity.Detail = System.IO.Path.GetFileName(child.Path) ?? child.Name;
+                            return child;
+                        })
+                        .ToArray();
                 }
                 catch (IOException ex)
                 {
@@ -830,9 +851,15 @@ namespace MediaBrowser.Controller.Entities
 
         private async Task RefreshMetadataRecursive(IList<BaseItem> children, MetadataRefreshOptions refreshOptions, bool recursive, IProgress<double> progress, CancellationToken cancellationToken)
         {
+            // Items that never got metadata (just added) go first, so they are ready before the scan
+            // finishes walking everything that did not change
+            var ordered = children
+                .OrderBy(c => c.DateLastRefreshed == default ? 0 : 1)
+                .ToList();
+
             await RunTasks(
                 (baseItem, innerProgress) => RefreshChildMetadata(baseItem, refreshOptions, recursive && baseItem.IsFolder, innerProgress, cancellationToken),
-                children,
+                ordered,
                 progress,
                 cancellationToken).ConfigureAwait(false);
         }

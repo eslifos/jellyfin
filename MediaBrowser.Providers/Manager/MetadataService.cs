@@ -91,6 +91,9 @@ namespace MediaBrowser.Providers.Manager
             var itemOfType = (TItemType)item;
             var updateType = ItemUpdateType.None;
 
+            // Shown live in the dashboard; the kind changes as the refresh goes on
+            using var activity = LibraryActivity.Begin(item, LibraryActivityKind.Checking);
+
             var libraryOptions = LibraryManager.GetLibraryOptions(item);
             var isFirstRefresh = item.DateLastRefreshed == DateTime.MinValue;
             var hasRefreshedMetadata = true;
@@ -182,6 +185,7 @@ namespace MediaBrowser.Providers.Manager
                     id.IsAutomated = refreshOptions.IsAutomated;
 
                     var hasMetadataSavers = ProviderManager.GetMetadataSavers(item, libraryOptions).Any();
+                    activity.Kind = LibraryActivityKind.Metadata;
                     var result = await RefreshWithProviders(metadataResult, id, refreshOptions, providers, ImageProvider, hasMetadataSavers, cancellationToken).ConfigureAwait(false);
 
                     updateType |= result.UpdateType;
@@ -203,6 +207,7 @@ namespace MediaBrowser.Providers.Manager
 
                 if (providers.Count > 0)
                 {
+                    activity.Kind = LibraryActivityKind.Images;
                     var result = await ImageProvider.RefreshImages(itemOfType, libraryOptions, providers, refreshOptions, cancellationToken).ConfigureAwait(false);
 
                     updateType |= result.UpdateType;
@@ -379,13 +384,19 @@ namespace MediaBrowser.Providers.Manager
                 {
                     Logger.LogDebug("File modification time changed from {Then} to {Now}: {Path}", item.DateModified, info.LastWriteTimeUtc, itemPath);
 
+                    // A file with a different size is a new copy that just arrived (an upgrade or a re-upload),
+                    // so it counts as added now. Copied files keep their old dates, which would bury it.
+                    var replaced = item.Size is > 0 && item.Size != info.Length;
                     item.DateModified = info.LastWriteTimeUtc;
-                    if (ServerConfigurationManager.GetMetadataConfiguration().UseFileCreationTimeForDateAdded)
+                    if (replaced)
                     {
-                        if (info.CreationTimeUtc > DateTime.MinValue)
-                        {
-                            item.DateCreated = info.CreationTimeUtc;
-                        }
+                        item.Size = info.Length;
+                        item.DateCreated = DateTime.UtcNow;
+                    }
+                    else if (ServerConfigurationManager.GetMetadataConfiguration().UseFileCreationTimeForDateAdded
+                        && info.CreationTimeUtc > item.DateCreated)
+                    {
+                        item.DateCreated = info.CreationTimeUtc;
                     }
 
                     if (item is Video video)
@@ -861,7 +872,7 @@ namespace MediaBrowser.Providers.Manager
                     }
                     catch (Exception ex)
                     {
-                        Logger.LogError(ex, "Error in {Provider} for {Item}", provider.Name, logName);
+                        NoteFailure(ex, provider.Name, logName);
 
                         // If a local provider fails, consider that a failure
                         refreshResult.ErrorMessage = ex.Message;
@@ -943,7 +954,7 @@ namespace MediaBrowser.Providers.Manager
             {
                 refreshResult.Failures++;
                 refreshResult.ErrorMessage = ex.Message;
-                Logger.LogError(ex, "Error in {Provider} for {Item}", provider.Name, logName);
+                NoteFailure(ex, provider.Name, logName);
             }
         }
 
@@ -1018,7 +1029,7 @@ namespace MediaBrowser.Providers.Manager
                 {
                     refreshResult.Failures++;
                     refreshResult.ErrorMessage = ex.Message;
-                    Logger.LogError(ex, "Error in {Provider} for {Item}", provider.Name, logName);
+                    NoteFailure(ex, provider.Name, logName);
                 }
             }
 
@@ -1117,6 +1128,23 @@ namespace MediaBrowser.Providers.Manager
                 Logger.LogError(ex, "Error in {Monitor}.HasChanged", changeMonitor.GetType().Name);
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Logs a provider failure. "Not found on that site" is normal (the other providers fill it in),
+        /// so it goes to the metadata activity as a notice instead of the errors.
+        /// </summary>
+        private void NoteFailure(Exception ex, string providerName, string logName)
+        {
+            if (ProviderErrors.IsNotFound(ex))
+            {
+                Logger.LogWarning("{Provider} does not have {Item}: {Message}", providerName, logName, ex.Message);
+                LibraryActivity.Note(null, LibraryActivityKind.Metadata, providerName + ": " + logName, ex.Message);
+                return;
+            }
+
+            Logger.LogError(ex, "Error in {Provider} for {Item}", providerName, logName);
+            LibraryActivity.Note(null, LibraryActivityKind.Error, providerName + ": " + logName, ex.Message);
         }
 
         /// <summary>

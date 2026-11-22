@@ -63,6 +63,7 @@ namespace MediaBrowser.Providers.Manager
         private readonly IServerConfigurationManager _configurationManager;
         private readonly IBaseItemManager _baseItemManager;
         private readonly ConcurrentDictionary<Guid, double> _activeRefreshes = new();
+        private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _runningRefreshes = new();
         private readonly CancellationTokenSource _disposeCancellationTokenSource = new();
         private readonly PriorityQueue<(Guid ItemId, MetadataRefreshOptions RefreshOptions), RefreshPriority> _refreshQueue = new();
         private readonly IMemoryCache _memoryCache;
@@ -89,7 +90,11 @@ namespace MediaBrowser.Providers.Manager
         private IMetadataSaver[] _savers = [];
         private IExternalId[] _externalIds = [];
         private IExternalUrlProvider[] _externalUrlProviders = [];
-        private bool _isProcessingRefreshQueue;
+        // Refreshes queued outside a library scan (new files found, manual refreshes) run on several workers
+        // at once, like the scan itself does; an item is never refreshed by two workers at the same time.
+        private readonly HashSet<Guid> _refreshInFlight = [];
+        private readonly List<((Guid ItemId, MetadataRefreshOptions RefreshOptions) Item, RefreshPriority Priority)> _refreshDeferred = [];
+        private int _refreshWorkers;
         private bool _disposed;
 
         /// <summary>
@@ -381,7 +386,14 @@ namespace MediaBrowser.Providers.Manager
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "{ProviderName} failed in GetImageInfos for type {ItemType} at {ItemPath}", provider.GetType().Name, item.GetType().Name, item.Path);
+                if (ProviderErrors.IsNotFound(ex))
+                {
+                    _logger.LogWarning("{ProviderName} has no images for {Item}: {Message}", provider.GetType().Name, item.Path ?? item.Name, ex.Message);
+                }
+                else
+                {
+                    _logger.LogError(ex, "{ProviderName} failed in GetImageInfos for type {ItemType} at {ItemPath}", provider.GetType().Name, item.GetType().Name, item.Path);
+                }
                 return Enumerable.Empty<RemoteImageInfo>();
             }
         }
@@ -798,9 +810,10 @@ namespace MediaBrowser.Providers.Manager
             }));
 
             // Fetchers
-            list.AddRange(imageProviders.Where(i => i is IDynamicImageProvider || (i is IRemoteImageProvider)).Select(i => new MetadataPlugin
+            // One entry per name: a provider can come as a pair (online covers + the cover inside the files)
+            list.AddRange(imageProviders.Where(i => i is IDynamicImageProvider || (i is IRemoteImageProvider)).Select(i => i.Name).Distinct(StringComparer.Ordinal).Select(name => new MetadataPlugin
             {
-                Name = i.Name,
+                Name = name,
                 Type = MetadataPluginType.ImageFetcher
             }));
         }
@@ -1175,15 +1188,141 @@ namespace MediaBrowser.Providers.Manager
             {
                 _refreshQueue.Enqueue((itemId, options), priority);
 
-                if (_isProcessingRefreshQueue)
+                if (_refreshWorkers >= GetRefreshWorkerLimit())
                 {
                     return;
                 }
 
-                _isProcessingRefreshQueue = true;
+                _refreshWorkers++;
             }
 
             Task.Run(StartProcessingRefreshQueue);
+        }
+
+        /// <inheritdoc/>
+        public int CancelLibraryRefresh(Guid libraryId)
+        {
+            var cache = new Dictionary<Guid, bool>();
+            bool InLibrary(Guid id)
+            {
+                if (id.Equals(libraryId))
+                {
+                    return true;
+                }
+
+                if (!cache.TryGetValue(id, out var inLibrary))
+                {
+                    var item = _libraryManager.GetItemById(id);
+                    inLibrary = item is not null && _libraryManager.GetCollectionFolders(item).Any(f => f.Id.Equals(libraryId));
+                    cache[id] = inLibrary;
+                }
+
+                return inLibrary;
+            }
+
+            // Look the items up outside the lock: the queue can hold thousands of them
+            List<Guid> queued;
+            lock (_refreshQueueLock)
+            {
+                queued = _refreshQueue.UnorderedItems.Select(x => x.Element.ItemId)
+                    .Concat(_refreshDeferred.Select(d => d.Item.ItemId))
+                    .Distinct()
+                    .ToList();
+            }
+
+            var drop = queued.Where(InLibrary).ToHashSet();
+            var stopped = 0;
+            if (drop.Count > 0)
+            {
+                lock (_refreshQueueLock)
+                {
+                    var keep = new List<((Guid ItemId, MetadataRefreshOptions RefreshOptions) Item, RefreshPriority Priority)>();
+                    while (_refreshQueue.TryDequeue(out var entry, out var priority))
+                    {
+                        if (drop.Contains(entry.ItemId))
+                        {
+                            stopped++;
+                        }
+                        else
+                        {
+                            keep.Add((entry, priority));
+                        }
+                    }
+
+                    foreach (var (entry, priority) in keep)
+                    {
+                        _refreshQueue.Enqueue(entry, priority);
+                    }
+
+                    stopped += _refreshDeferred.RemoveAll(d => drop.Contains(d.Item.ItemId));
+                }
+            }
+
+            foreach (var (id, running) in _runningRefreshes)
+            {
+                if (!InLibrary(id))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    running.Cancel();
+                    stopped++;
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Finished in the meantime
+                }
+            }
+
+            _logger.LogInformation("Stopped {Count} refreshes of library {LibraryId:N}", stopped, libraryId);
+            return stopped;
+        }
+
+        /// <summary>
+        /// Workers for the refresh queue: the "Library metadata refresh concurrency" setting, or 3 when unset.
+        /// Refreshing mostly waits on the network share and on the internet, not on the processor.
+        /// </summary>
+        private int GetRefreshWorkerLimit()
+        {
+            var configured = _configurationManager.Configuration.LibraryMetadataRefreshConcurrency;
+            return configured > 0 ? configured : 3;
+        }
+
+        /// <summary>
+        /// Takes the next queued refresh whose item is not being refreshed by another worker. Must be called under the lock.
+        /// </summary>
+        private bool TryTakeNextRefresh(out (Guid ItemId, MetadataRefreshOptions RefreshOptions) refreshItem)
+        {
+            while (_refreshQueue.TryDequeue(out refreshItem, out var priority))
+            {
+                if (_refreshInFlight.Add(refreshItem.ItemId))
+                {
+                    return true;
+                }
+
+                // Same item already running elsewhere: run this one after it
+                _refreshDeferred.Add((refreshItem, priority));
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Marks an item as done and puts back refreshes of it that waited. Must be called under the lock.
+        /// </summary>
+        private void CompleteRefresh(Guid itemId)
+        {
+            _refreshInFlight.Remove(itemId);
+            for (var i = _refreshDeferred.Count - 1; i >= 0; i--)
+            {
+                if (_refreshDeferred[i].Item.ItemId.Equals(itemId))
+                {
+                    _refreshQueue.Enqueue(_refreshDeferred[i].Item, _refreshDeferred[i].Priority);
+                    _refreshDeferred.RemoveAt(i);
+                }
+            }
         }
 
         private async Task StartProcessingRefreshQueue()
@@ -1194,7 +1333,7 @@ namespace MediaBrowser.Providers.Manager
             {
                 lock (_refreshQueueLock)
                 {
-                    _isProcessingRefreshQueue = false;
+                    _refreshWorkers--;
                 }
 
                 return;
@@ -1214,12 +1353,16 @@ namespace MediaBrowser.Providers.Manager
                 {
                     if (_disposed
                         || cancellationToken.IsCancellationRequested
-                        || !_refreshQueue.TryDequeue(out refreshItem, out _))
+                        || !TryTakeNextRefresh(out refreshItem))
                     {
-                        _isProcessingRefreshQueue = false;
+                        _refreshWorkers--;
                         break;
                     }
                 }
+
+                // Each refresh can be stopped on its own (stopping a library scan from the dashboard)
+                using var itemCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                _runningRefreshes[refreshItem.ItemId] = itemCancellation;
 
                 try
                 {
@@ -1230,8 +1373,8 @@ namespace MediaBrowser.Providers.Manager
                     }
 
                     var task = item is MusicArtist artist
-                        ? RefreshArtist(artist, refreshItem.RefreshOptions, cancellationToken)
-                        : RefreshItem(item, refreshItem.RefreshOptions, cancellationToken);
+                        ? RefreshArtist(artist, refreshItem.RefreshOptions, itemCancellation.Token)
+                        : RefreshItem(item, refreshItem.RefreshOptions, itemCancellation.Token);
 
                     await task.ConfigureAwait(false);
                 }
@@ -1240,11 +1383,23 @@ namespace MediaBrowser.Providers.Manager
                     // Shutting down: the next pass sees the token and stands the processor down.
                     continue;
                 }
+                catch (OperationCanceledException) when (itemCancellation.IsCancellationRequested)
+                {
+                    _logger.LogInformation("Refresh of {ItemId:N} stopped by an administrator", refreshItem.ItemId);
+                }
                 catch (Exception ex)
                 {
                     // Includes a provider that cancelled for its own reasons, such as an HTTP
                     // timeout, which must not stop the queue draining.
                     _logger.LogError(ex, "Error refreshing item");
+                }
+                finally
+                {
+                    _runningRefreshes.TryRemove(new KeyValuePair<Guid, CancellationTokenSource>(refreshItem.ItemId, itemCancellation));
+                    lock (_refreshQueueLock)
+                    {
+                        CompleteRefresh(refreshItem.ItemId);
+                    }
                 }
             }
 
@@ -1272,6 +1427,19 @@ namespace MediaBrowser.Providers.Manager
 
         private async Task RefreshCollectionFolderChildren(MetadataRefreshOptions options, CollectionFolder collectionFolder, CancellationToken cancellationToken)
         {
+            // A folder added to the library that no full scan registered yet has no item and would be skipped
+            // by every library refresh: register the library folders first
+            var known = collectionFolder.GetPhysicalFolders().Select(f => f.Path).ToList();
+            var missing = collectionFolder.PhysicalLocations
+                .Where(l => !_fileSystem.AreEqual(l, collectionFolder.Path) && !known.Any(p => _fileSystem.AreEqual(p, l)))
+                .ToList();
+            if (missing.Count > 0)
+            {
+                _logger.LogInformation("Registering library folders not scanned yet: {Folders}", string.Join(", ", missing));
+                await _libraryManager.ValidateTopLibraryFolders(cancellationToken).ConfigureAwait(false);
+                await collectionFolder.RefreshMetadata(options, cancellationToken).ConfigureAwait(false);
+            }
+
             foreach (var child in collectionFolder.GetPhysicalFolders())
             {
                 await child.RefreshMetadata(options, cancellationToken).ConfigureAwait(false);

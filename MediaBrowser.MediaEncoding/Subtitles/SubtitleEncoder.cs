@@ -152,6 +152,62 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             }
         }
 
+        /// <inheritdoc />
+        public async Task<(Stream? Content, bool Complete)> GetPartialSubtitles(BaseItem item, string mediaSourceId, int subtitleStreamIndex, string outputFormat, CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(item);
+
+            var mediaSources = await _mediaSourceManager.GetPlaybackMediaSources(item, null, true, false, cancellationToken).ConfigureAwait(false);
+            var mediaSource = mediaSources.FirstOrDefault(i => string.Equals(i.Id, mediaSourceId, StringComparison.OrdinalIgnoreCase));
+            var subtitleStream = mediaSource?.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Subtitle && i.Index == subtitleStreamIndex);
+
+            // Only text subtitles inside the video file are extracted to .srt (written little by little)
+            if (mediaSource is null
+                || subtitleStream is null
+                || (subtitleStream.IsExternal && !subtitleStream.Path.EndsWith(".mks", StringComparison.OrdinalIgnoreCase))
+                || !string.Equals(GetExtractableSubtitleFileExtension(subtitleStream), "srt", StringComparison.OrdinalIgnoreCase))
+            {
+                return (null, true);
+            }
+
+            var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, ".srt");
+            if (outputPath is null)
+            {
+                return (null, true);
+            }
+
+            var sourcePath = string.IsNullOrEmpty(subtitleStream.Path) ? mediaSource.Path : subtitleStream.Path;
+            var complete = IsCachedSubtitleFresh(outputPath, sourcePath);
+            if (!File.Exists(outputPath))
+            {
+                return (null, complete);
+            }
+
+            // ffmpeg may still be appending to the file: read what is there and keep only the finished blocks
+            string text;
+            var fileStream = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            await using (fileStream.ConfigureAwait(false))
+            {
+                using var reader = new StreamReader(fileStream, Encoding.UTF8, true);
+                text = (await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false)).Replace("\r\n", "\n", StringComparison.Ordinal);
+            }
+
+            if (!complete)
+            {
+                var lastBlock = text.LastIndexOf("\n\n", StringComparison.Ordinal);
+                text = lastBlock < 0 ? string.Empty : text[..(lastBlock + 2)];
+            }
+
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return (null, complete);
+            }
+
+            using var partial = new MemoryStream(Encoding.UTF8.GetBytes(text));
+            var info = new SubtitleInfo { Path = outputPath, Protocol = MediaProtocol.File, Format = "srt" };
+            return (ConvertSubtitles(partial, info, outputFormat, 0, 0, true), complete);
+        }
+
         private async Task<(Stream Stream, SubtitleInfo Info)> GetSubtitleStream(
             MediaSourceInfo mediaSource,
             MediaStream subtitleStream,

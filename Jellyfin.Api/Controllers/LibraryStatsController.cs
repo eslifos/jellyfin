@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using Jellyfin.Api.Models.LibraryDtos;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Enums;
@@ -13,6 +14,7 @@ using MediaBrowser.Model.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Api.Controllers;
 
@@ -25,19 +27,23 @@ public class LibraryStatsController : BaseJellyfinApiController
 {
     private static readonly TimeSpan _cacheLifetime = TimeSpan.FromMinutes(5);
     private static readonly ConcurrentDictionary<Guid, LibraryStatsDto> _cache = new();
+    private static readonly ConcurrentDictionary<Guid, byte> _computing = new();
 
     private readonly ILibraryManager _libraryManager;
     private readonly ITaskManager _taskManager;
+    private readonly ILogger<LibraryStatsController> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="LibraryStatsController"/> class.
     /// </summary>
     /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
     /// <param name="taskManager">Instance of the <see cref="ITaskManager"/> interface.</param>
-    public LibraryStatsController(ILibraryManager libraryManager, ITaskManager taskManager)
+    /// <param name="logger">Instance of the <see cref="ILogger{LibraryStatsController}"/> interface.</param>
+    public LibraryStatsController(ILibraryManager libraryManager, ITaskManager taskManager, ILogger<LibraryStatsController> logger)
     {
         _libraryManager = libraryManager;
         _taskManager = taskManager;
+        _logger = logger;
     }
 
     /// <summary>
@@ -62,11 +68,34 @@ public class LibraryStatsController : BaseJellyfinApiController
                 continue;
             }
 
-            if (!refresh
-                && _cache.TryGetValue(id, out var cached)
-                && DateTime.UtcNow - cached.ComputedAt < _cacheLifetime)
+            // Old numbers are returned right away and recomputed in the background, so the page never waits
+            if (!refresh && _cache.TryGetValue(id, out var cached))
             {
                 result.Add(cached);
+                if (DateTime.UtcNow - cached.ComputedAt >= _cacheLifetime && _computing.TryAdd(id, 0))
+                {
+                    var libraryId = id;
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            var fresh = Compute(libraryId, lastLibraryScan);
+                            if (fresh is not null)
+                            {
+                                _cache[libraryId] = fresh;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Could not compute the statistics of library {LibraryId}", libraryId);
+                        }
+                        finally
+                        {
+                            _computing.TryRemove(libraryId, out _);
+                        }
+                    });
+                }
+
                 continue;
             }
 
@@ -104,7 +133,8 @@ public class LibraryStatsController : BaseJellyfinApiController
             IncludeItemTypes = [BaseItemKind.Season]
         });
 
-        var files = _libraryManager.GetItemList(new InternalItemsQuery
+        // Summed by the database: loading every file of a big library took tens of seconds
+        var files = _libraryManager.GetFileTotals(new InternalItemsQuery
         {
             ParentId = libraryId,
             Recursive = true,
@@ -145,10 +175,10 @@ public class LibraryStatsController : BaseJellyfinApiController
             MusicVideoCount = counts.MusicVideoCount,
             BookCount = counts.BookCount,
             BoxSetCount = counts.BoxSetCount,
-            PhotoCount = files.Count(i => i.GetBaseItemKind() == BaseItemKind.Photo),
-            VideoCount = files.Count(i => i.GetBaseItemKind() == BaseItemKind.Video),
-            TotalSize = files.Sum(i => i.Size ?? 0),
-            TotalRunTimeTicks = files.Sum(i => i.RunTimeTicks ?? 0),
+            PhotoCount = files.PhotoCount,
+            VideoCount = files.VideoCount,
+            TotalSize = files.Size,
+            TotalRunTimeTicks = files.RunTimeTicks,
             LastScanDate = scanDate,
             LastAddedDate = latest?.DateCreated,
             LastAddedName = latest switch

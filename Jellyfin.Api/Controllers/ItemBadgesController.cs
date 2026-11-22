@@ -27,7 +27,8 @@ namespace Jellyfin.Api.Controllers;
 public partial class ItemBadgesController : BaseJellyfinApiController
 {
     private const int MaxIds = 200;
-    private const int EpisodesSampled = 12;
+    // A few recent episodes are enough to tell a series' quality; each one is a database read
+    private const int EpisodesSampled = 4;
 
     private static readonly ConcurrentDictionary<Guid, (DateTime Saved, ItemBadges Badges)> _cache = new();
 
@@ -171,7 +172,7 @@ public partial class ItemBadgesController : BaseJellyfinApiController
                 badges.RuntimeMinutes = (int)Math.Round(TimeSpan.FromTicks(ticks).TotalMinutes);
             }
 
-            var media = Analyze(video);
+            var media = AnalyzeBestVersion(video);
             badges.Resolution = media.Resolution;
             badges.Hdr = media.Hdr;
             badges.Audio = media.Audio;
@@ -207,6 +208,46 @@ public partial class ItemBadgesController : BaseJellyfinApiController
         return badges;
     }
 
+    /// <summary>
+    /// A movie with several versions (4K and 1080p) shows the best one, whatever version gets played.
+    /// </summary>
+    private (string? Resolution, string? Hdr, string? Audio, string? Source, string? Edition, int AudioLanguages) AnalyzeBestVersion(Video video)
+    {
+        if (video.MediaSourceCount <= 1)
+        {
+            return Analyze(video);
+        }
+
+        try
+        {
+            var versions = _mediaSourceManager.GetStaticMediaSources(video, false)
+                .Select(source => Analyze(source.MediaStreams ?? (IReadOnlyList<MediaStream>)Array.Empty<MediaStream>(), source.Path))
+                .ToList();
+            if (versions.Count > 0)
+            {
+                return versions
+                    .OrderByDescending(v => ResolutionRank(v.Resolution))
+                    .ThenByDescending(v => v.Hdr is null ? 0 : 1)
+                    .First();
+            }
+        }
+        catch (Exception)
+        {
+            // Fall back to the primary version
+        }
+
+        return Analyze(video);
+    }
+
+    private static int ResolutionRank(string? resolution) => resolution switch
+    {
+        "4K" => 4,
+        "1080P" => 3,
+        "720P" => 2,
+        "SD" => 1,
+        _ => 0
+    };
+
     private (string? Resolution, string? Hdr, string? Audio, string? Source, string? Edition, int AudioLanguages) Analyze(Video video)
     {
         IReadOnlyList<MediaStream> streams;
@@ -219,6 +260,12 @@ public partial class ItemBadgesController : BaseJellyfinApiController
             streams = Array.Empty<MediaStream>();
         }
 
+        return Analyze(streams, video.Path);
+    }
+
+    private static (string? Resolution, string? Hdr, string? Audio, string? Source, string? Edition, int AudioLanguages) Analyze(IReadOnlyList<MediaStream> streams, string? path)
+    {
+
         var v = streams.FirstOrDefault(s => s.Type == MediaStreamType.Video && !string.Equals(s.Codec, "mjpeg", StringComparison.OrdinalIgnoreCase));
         var audio = streams.Where(s => s.Type == MediaStreamType.Audio).ToList();
         var mainAudio = audio.FirstOrDefault(a => a.IsDefault) ?? audio.FirstOrDefault();
@@ -229,8 +276,8 @@ public partial class ItemBadgesController : BaseJellyfinApiController
             .Distinct()
             .Count();
 
-        var fileName = string.IsNullOrEmpty(video.Path) ? string.Empty : Path.GetFileNameWithoutExtension(video.Path);
-        var folder = string.IsNullOrEmpty(video.Path) ? string.Empty : Path.GetFileName(Path.GetDirectoryName(video.Path)) ?? string.Empty;
+        var fileName = string.IsNullOrEmpty(path) ? string.Empty : Path.GetFileNameWithoutExtension(path);
+        var folder = string.IsNullOrEmpty(path) ? string.Empty : Path.GetFileName(Path.GetDirectoryName(path)) ?? string.Empty;
         var names = fileName + " " + folder;
 
         return (Resolution(v), Hdr(v), AudioLabel(mainAudio), Source(names), Edition(names), languages);

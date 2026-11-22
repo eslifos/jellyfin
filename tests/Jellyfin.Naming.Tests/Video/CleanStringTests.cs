@@ -14,6 +14,8 @@ namespace Jellyfin.Naming.Tests.Video
         [InlineData("Super movie 480p 2001.mp4", "Super movie")]
         [InlineData("Super movie [480p].mp4", "Super movie")]
         [InlineData("480 Super movie [tmdbid=12345].mp4", "480 Super movie")]
+        [InlineData("Seal Team Eight - Behind Enemy Lines {tmdb-260063} {imdb-tt2992552}", "Seal Team Eight - Behind Enemy Lines")]
+        [InlineData("Some Movie {imdb-tt2992552}.mkv", "Some Movie")]
         [InlineData("Crouching.Tiger.Hidden.Dragon.4k.mkv", "Crouching.Tiger.Hidden.Dragon")]
         [InlineData("Crouching.Tiger.Hidden.Dragon.UltraHD.mkv", "Crouching.Tiger.Hidden.Dragon")]
         [InlineData("Crouching.Tiger.Hidden.Dragon.UHD.mkv", "Crouching.Tiger.Hidden.Dragon")]

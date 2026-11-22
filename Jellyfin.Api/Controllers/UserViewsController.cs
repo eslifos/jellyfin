@@ -87,8 +87,14 @@ public class UserViewsController : BaseJellyfinApiController
 
         var folders = _userViewManager.GetUserViews(query);
 
-        var dtoOptions = new DtoOptions();
-        dtoOptions.Fields = [.. dtoOptions.Fields, ItemFields.PrimaryImageAspectRatio, ItemFields.DisplayPreferencesId];
+        // Only what the menus use. All fields plus user data made the server count every title of every
+        // library and which ones were watched on each call (tens of seconds on big libraries), and the
+        // apps ask for the views on almost every page
+        var dtoOptions = new DtoOptions(false)
+        {
+            Fields = [ItemFields.PrimaryImageAspectRatio, ItemFields.DisplayPreferencesId, ItemFields.SortName, ItemFields.Path],
+            EnableUserData = false
+        };
 
         var dtos = _dtoService.GetBaseItemDtos(folders, dtoOptions, user, skipVisibilityCheck: true);
 

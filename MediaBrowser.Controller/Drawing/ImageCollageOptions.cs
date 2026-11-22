@@ -31,5 +31,10 @@ namespace MediaBrowser.Controller.Drawing
         /// </summary>
         /// <value>The height.</value>
         public int Height { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the images are stacked in horizontal strips (collection covers).
+        /// </summary>
+        public bool Strips { get; set; }
     }
 }

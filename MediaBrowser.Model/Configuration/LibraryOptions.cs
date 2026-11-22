@@ -42,6 +42,12 @@ namespace MediaBrowser.Model.Configuration
 
         public bool Enabled { get; set; } = true;
 
+        /// <summary>
+        /// Gets or sets the theme of a mixed movies and shows library: "anime" or "kids" (null for none).
+        /// The app uses it for the start screen, icon and colours; scanning works as for any mixed library.
+        /// </summary>
+        public string? ContentTheme { get; set; }
+
         public bool EnablePhotos { get; set; }
 
         public bool EnableRealtimeMonitor { get; set; }

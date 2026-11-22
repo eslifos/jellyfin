@@ -94,6 +94,63 @@ public partial class StripCollageBuilder
         pixmap.Encode(outputStream, GetEncodedFormat(outputPath), 90);
     }
 
+    /// <summary>
+    /// Create a collage of up to 3 images stacked in horizontal strips (each one cropped to fill its strip).
+    /// </summary>
+    /// <param name="paths">The paths of the images to use in the collage.</param>
+    /// <param name="outputPath">The path at which to place the resulting collage image.</param>
+    /// <param name="width">The desired width of the collage.</param>
+    /// <param name="height">The desired height of the collage.</param>
+    public void BuildStripCollage(IReadOnlyList<string> paths, string outputPath, int width, int height)
+    {
+        const int Gap = 4;
+        using var bitmap = new SKBitmap(width, height);
+        using (var canvas = new SKCanvas(bitmap))
+        {
+            canvas.Clear(SKColors.Black);
+            var count = Math.Clamp(paths.Count, 1, 3);
+            var stripHeight = (height - (Gap * (count - 1))) / count;
+            var targetRatio = (double)width / stripHeight;
+            var imageIndex = 0;
+
+            for (var i = 0; i < count; i++)
+            {
+                using var image = SkiaHelper.GetNextValidImage(_skiaEncoder, paths, imageIndex, out int newIndex);
+                imageIndex = newIndex;
+                if (image is null)
+                {
+                    break;
+                }
+
+                // Crop to the strip shape: centered horizontally, a bit above the middle vertically (faces)
+                var cropWidth = image.Width;
+                var cropHeight = (int)Math.Round(image.Width / targetRatio);
+                if (cropHeight > image.Height)
+                {
+                    cropHeight = image.Height;
+                    cropWidth = (int)Math.Round(image.Height * targetRatio);
+                }
+
+                var left = (image.Width - cropWidth) / 2;
+                var top = (int)((image.Height - cropHeight) * 0.3);
+                using var cropped = new SKBitmap();
+                if (!image.ExtractSubset(cropped, SKRectI.Create(left, top, cropWidth, cropHeight)))
+                {
+                    continue;
+                }
+
+                var info = new SKImageInfo(width, stripHeight, image.ColorType, image.AlphaType, image.ColorSpace);
+                using var resized = SkiaEncoder.ResizeImage(cropped, info);
+                using var paint = new SKPaint();
+                canvas.DrawImage(resized, 0, i * (stripHeight + Gap), SkiaEncoder.DefaultSamplingOptions, paint);
+            }
+        }
+
+        using var outputStream = new SKFileWStream(outputPath);
+        using var pixmap = new SKPixmap(new SKImageInfo(width, height), bitmap.GetPixels());
+        pixmap.Encode(outputStream, GetEncodedFormat(outputPath), 90);
+    }
+
     private SKBitmap BuildThumbCollageBitmap(IReadOnlyList<string> paths, int width, int height, string? libraryName)
     {
         var bitmap = new SKBitmap(width, height);

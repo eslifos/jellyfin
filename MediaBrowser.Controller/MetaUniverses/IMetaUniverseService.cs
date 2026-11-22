@@ -1,4 +1,7 @@
+using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.Entities;
 using MediaBrowser.Model.MetaUniverses;
 
@@ -40,7 +43,11 @@ public interface IMetaUniverseService
     bool Delete(string id);
 
     /// <summary>
-    /// Forces the universes to be rebuilt on the next request.
+    /// Prepares the universes and what each user can see of them, while the previous ones keep being served.
     /// </summary>
-    void Invalidate();
+    /// <param name="force">Build even when the libraries have not changed.</param>
+    /// <param name="progress">The progress.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>A task that finishes when they are ready.</returns>
+    Task BuildAsync(bool force, IProgress<double> progress, CancellationToken cancellationToken);
 }

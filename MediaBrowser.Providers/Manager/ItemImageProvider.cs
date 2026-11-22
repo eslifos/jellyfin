@@ -230,6 +230,18 @@ namespace MediaBrowser.Providers.Manager
             return result;
         }
 
+        /// <summary>"Not found on that site" is normal for images too: a warning, not an error.</summary>
+        private void LogFailure(Exception ex, string providerName, BaseItem item)
+        {
+            if (ProviderErrors.IsNotFound(ex))
+            {
+                _logger.LogWarning("{Provider} does not have {Item}: {Message}", providerName, item.Path ?? item.Name, ex.Message);
+                return;
+            }
+
+            _logger.LogError(ex, "Error in {Provider} for {Item}", providerName, item.Path ?? item.Name);
+        }
+
         /// <summary>
         /// Refreshes from a dynamic provider.
         /// </summary>
@@ -303,7 +315,7 @@ namespace MediaBrowser.Providers.Manager
             {
                 result.Failures++;
                 result.ErrorMessage = ex.Message;
-                _logger.LogError(ex, "Error in {Provider} for {Item}", provider.Name, item.Path ?? item.Name);
+                LogFailure(ex, provider.Name, item);
             }
         }
 
@@ -393,7 +405,7 @@ namespace MediaBrowser.Providers.Manager
             {
                 result.Failures++;
                 result.ErrorMessage = ex.Message;
-                _logger.LogError(ex, "Error in {Provider} for {Item}", provider.Name, item.Path ?? item.Name);
+                LogFailure(ex, provider.Name, item);
             }
         }
 

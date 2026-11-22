@@ -20,6 +20,9 @@ namespace Jellyfin.Naming.Tests.TV
         [InlineData("/some/path/The Show s02e10 720p hdtv", "The Show")]
         [InlineData("/some/path/The Show s02e10 the episode 720p hdtv", "The Show")]
         [InlineData("/some/path/1923 (2022)", "1923")]
+        [InlineData("/some/path/72 Dangerous Animals - Latin America (2017) {tvdb-339632} {imdb-tt7909708}", "72 Dangerous Animals - Latin America")]
+        [InlineData("/some/path/72 Dangerous Animals - Latin America {tvdb-339632} {imdb-tt7909708}", "72 Dangerous Animals - Latin America")]
+        [InlineData("/some/path/The Show [tvdbid-1234]", "The Show")]
         // A dotted acronym keeps its dots when it follows words, whether they are space or dot separated
         [InlineData("/some/path/Marvel's Agents of S.H.I.E.L.D.", "Marvel's Agents of S.H.I.E.L.D.")]
         [InlineData("Marvel's.Agents.of.S.H.I.E.L.D.", "Marvel's Agents of S.H.I.E.L.D.")]

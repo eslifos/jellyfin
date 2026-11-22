@@ -123,5 +123,6 @@
     "NameExtraThemeVideo": "Video de presentación",
     "NameExtraTrailer": "Tráiler",
     "NameExtraUnknown": "Extra",
-    "Original": "Original"
+    "Original": "Original",
+    "UserDownloadedItemWithValues": "{0} descargó {1} en {2} para verlo sin conexión"
 }

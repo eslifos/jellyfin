@@ -598,6 +598,61 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
         }
 
         /// <summary>
+        /// Gets a TMDb series list: "trending-day", "trending-week" or "popular". Cached for 3 hours.
+        /// </summary>
+        /// <param name="list">The list.</param>
+        /// <param name="language">The language (e.g. es-419).</param>
+        /// <param name="countryCode">The country.</param>
+        /// <param name="pages">How many pages of 20 series to read.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The series, in the list order.</returns>
+        public async Task<IReadOnlyList<SearchTv>> GetTvListAsync(string list, string? language, string? countryCode, int pages, CancellationToken cancellationToken)
+        {
+            var lang = TmdbUtils.NormalizeLanguage(language, countryCode);
+            var key = $"tvlist-{list}-{lang}-{pages.ToString(CultureInfo.InvariantCulture)}";
+            if (_memoryCache.TryGetValue(key, out List<SearchTv>? cached) && cached is not null)
+            {
+                return cached;
+            }
+
+            await EnsureClientConfigAsync().ConfigureAwait(false);
+
+            var result = new List<SearchTv>();
+            var seen = new HashSet<int>();
+            for (var page = 1; page <= pages; page++)
+            {
+                SearchContainer<SearchTv>? container = list switch
+                {
+                    "trending-day" => await _tmDbClient.GetTrendingTvAsync(TimeWindow.Day, page, lang, cancellationToken).ConfigureAwait(false),
+                    "trending-week" => await _tmDbClient.GetTrendingTvAsync(TimeWindow.Week, page, lang, cancellationToken).ConfigureAwait(false),
+                    "popular" => await _tmDbClient.GetTvShowPopularAsync(page, lang, cancellationToken).ConfigureAwait(false),
+                    _ => null
+                };
+
+                if (container?.Results is null || container.Results.Count == 0)
+                {
+                    break;
+                }
+
+                foreach (var show in container.Results)
+                {
+                    if (seen.Add(show.Id))
+                    {
+                        result.Add(show);
+                    }
+                }
+
+                if (page >= container.TotalPages)
+                {
+                    break;
+                }
+            }
+
+            _memoryCache.Set(key, result, new MemoryCacheEntryOptions().SetSize(1).SetAbsoluteExpiration(TimeSpan.FromHours(3)));
+            return result;
+        }
+
+        /// <summary>
         /// Gets the videos (trailers, teasers…) of a movie or series in one language ("es-MX", "en-US"…). Cached for 12 hours.
         /// </summary>
         /// <param name="tmdbId">The TMDb id.</param>

@@ -171,8 +171,10 @@ public sealed class LimitedConcurrencyLibraryScheduler : ILimitedConcurrencyLibr
         var fanoutConcurrency = _serverConfigurationManager.Configuration.LibraryScanFanoutConcurrency;
         if (fanoutConcurrency <= 0)
         {
-            // in case the user did not set a limit manually, we can assume he has 3 or more cores as already checked by ShouldForceSequentialOperation.
-            return Environment.ProcessorCount - 3;
+            // No limit set by the user: scans mostly wait on the disk / network share and on the internet,
+            // not on the processor, so use 4 workers (fewer only on very small machines). "Cores - 3" left a
+            // 4-core server scanning one folder at a time. A manual setting still wins.
+            return Math.Clamp(Environment.ProcessorCount, 2, 4);
         }
 
         return fanoutConcurrency;

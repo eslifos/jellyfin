@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Api.Attributes;
 using Jellyfin.Api.Extensions;
+using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Discovery;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
@@ -68,12 +69,13 @@ public class DiscoveryController : BaseJellyfinApiController
     /// Gets the rows of the start screen of a movie library.
     /// </summary>
     /// <param name="parentId">The library id.</param>
+    /// <param name="theme">"anime" or "kids": in theaters and upcoming only show movies of that kind.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <response code="200">Rows returned.</response>
     /// <returns>The rows.</returns>
     [HttpGet("Library/{parentId}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public async Task<ActionResult<LibraryDiscovery>> GetLibrary([FromRoute] Guid parentId, CancellationToken cancellationToken = default)
+    public async Task<ActionResult<LibraryDiscovery>> GetLibrary([FromRoute] Guid parentId, [FromQuery] string? theme = null, CancellationToken cancellationToken = default)
     {
         var user = _userManager.GetUserById(User.GetUserId());
         if (user is null)
@@ -81,7 +83,54 @@ public class DiscoveryController : BaseJellyfinApiController
             return Unauthorized();
         }
 
-        return Ok(await _discovery.GetLibraryAsync(user, parentId, cancellationToken).ConfigureAwait(false));
+        return Ok(await _discovery.GetLibraryAsync(user, parentId, theme, cancellationToken).ConfigureAwait(false));
+    }
+
+    /// <summary>
+    /// Gets the top 10 movies or series of all the libraries (what people watch right now).
+    /// </summary>
+    /// <param name="series">True for series, false for movies.</param>
+    /// <param name="auto">True to get the automatic list even when the top 10 is picked by hand.</param>
+    /// <param name="parentId">Only the titles of this library.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <response code="200">Item ids returned, best ranked first.</response>
+    /// <returns>The item ids.</returns>
+    [HttpGet("Top10")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<ActionResult<IReadOnlyList<Guid>>> GetTop10([FromQuery] bool series = false, [FromQuery] bool auto = false, [FromQuery] Guid? parentId = null, CancellationToken cancellationToken = default)
+    {
+        var user = _userManager.GetUserById(User.GetUserId());
+        if (user is null)
+        {
+            return Unauthorized();
+        }
+
+        return Ok(await _discovery.GetTop10Async(user, series, auto, parentId, cancellationToken).ConfigureAwait(false));
+    }
+
+    /// <summary>
+    /// Gets how the top 10 rows are built (automatic or by hand, and the titles picked).
+    /// </summary>
+    /// <response code="200">Settings returned.</response>
+    /// <returns>The settings.</returns>
+    [HttpGet("Top10/Settings")]
+    [Authorize(Policy = Policies.RequiresElevation)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public ActionResult<Top10Settings> GetTop10Settings() => _discovery.GetTop10Settings();
+
+    /// <summary>
+    /// Saves how the top 10 rows are built.
+    /// </summary>
+    /// <param name="settings">The settings.</param>
+    /// <response code="204">Settings saved.</response>
+    /// <returns>No content.</returns>
+    [HttpPost("Top10/Settings")]
+    [Authorize(Policy = Policies.RequiresElevation)]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    public ActionResult SaveTop10Settings([FromBody] Top10Settings settings)
+    {
+        _discovery.SaveTop10Settings(settings);
+        return NoContent();
     }
 
     /// <summary>

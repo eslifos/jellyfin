@@ -647,6 +647,9 @@ namespace Emby.Server.Implementations
             serviceCollection.AddSingleton<MediaBrowser.Controller.MetaUniverses.IMetaUniverseService, Emby.Server.Implementations.MetaUniverses.MetaUniverseService>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.Imdb.IImdbRatingsService, Emby.Server.Implementations.Imdb.ImdbRatingsService>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.Discovery.IDiscoveryService, Emby.Server.Implementations.Discovery.DiscoveryService>();
+        serviceCollection.AddSingleton<MediaBrowser.Controller.Home.IHomeSnapshotService, Emby.Server.Implementations.Home.HomeSnapshotService>();
+        serviceCollection.AddSingleton<MediaBrowser.Controller.Home.IAudiobookCatalog, Emby.Server.Implementations.Home.AudiobookCatalog>();
+        serviceCollection.AddSingleton<MediaBrowser.Controller.Downloads.IDownloadMonitor, Emby.Server.Implementations.Downloads.DownloadMonitor>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.Discovery.ITrailerVideoService, Emby.Server.Implementations.Discovery.TrailerVideoService>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.EpisodeOrder.IEpisodeOrderService, Emby.Server.Implementations.EpisodeOrder.EpisodeOrderService>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.PlaybackStats.IPlaybackStatsService>(sp => sp.GetRequiredService<Emby.Server.Implementations.PlaybackStats.PlaybackStatsStore>());

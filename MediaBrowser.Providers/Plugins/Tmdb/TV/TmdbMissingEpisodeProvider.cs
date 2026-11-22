@@ -64,11 +64,44 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
                 return false;
             }
 
-            return item is Series series && series.HasProviderId(MetadataProvider.Tmdb);
+            if (item is not Series series || !series.HasProviderId(MetadataProvider.Tmdb))
+            {
+                return false;
+            }
+
+            // Library scans: only series never checked, whose episode files changed, or that are due.
+            // Without this every scan asked TMDb for every series and all its seasons.
+            if (!TmdbMissingEpisodeCheckStore.TryGet(series.Id, out var last))
+            {
+                return true;
+            }
+
+            if (CountEpisodeFiles(series) != last.EpisodeFiles)
+            {
+                return true;
+            }
+
+            var maxAge = series.Status == SeriesStatus.Ended ? TimeSpan.FromDays(30) : TimeSpan.FromDays(2);
+            return DateTime.UtcNow - last.CheckedUtc >= maxAge;
         }
 
         /// <inheritdoc />
         public async Task<ItemUpdateType> FetchAsync(Series item, MetadataRefreshOptions options, CancellationToken cancellationToken)
+        {
+            var result = await FetchInternalAsync(item, options, cancellationToken).ConfigureAwait(false);
+            TmdbMissingEpisodeCheckStore.Set(item.Id, CountEpisodeFiles(item));
+            return result;
+        }
+
+        private int CountEpisodeFiles(Series series) => _libraryManager.GetCount(new InternalItemsQuery
+        {
+            AncestorIds = [series.Id],
+            IncludeItemTypes = [Jellyfin.Data.Enums.BaseItemKind.Episode],
+            IsVirtualItem = false,
+            Recursive = true
+        });
+
+        private async Task<ItemUpdateType> FetchInternalAsync(Series item, MetadataRefreshOptions options, CancellationToken cancellationToken)
         {
             var configuration = Plugin.Instance?.Configuration;
             var importUnaired = (configuration?.ImportUnairedEpisodes).GetValueOrDefault();

@@ -768,6 +768,13 @@ namespace MediaBrowser.Controller.Library
         ItemCounts GetItemCounts(InternalItemsQuery query);
 
         /// <summary>
+        /// Gets the count, total size and total runtime of the items matching the query without loading them.
+        /// </summary>
+        /// <param name="query">The query.</param>
+        /// <returns>The totals.</returns>
+        MediaBrowser.Controller.Persistence.ItemFileTotals GetFileTotals(InternalItemsQuery query);
+
+        /// <summary>
         /// Gets item counts for a "by-name" item using an optimized query path.
         /// </summary>
         /// <param name="kind">The kind of the name item.</param>
