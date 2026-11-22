@@ -81,7 +81,7 @@ public class ResourceMonitorController : BaseJellyfinApiController
             ProcessCpuPercent = processCpu,
             CpuCores = cores,
             LoadAverage = ReadLoadAverage(),
-            MemoryTotalBytes = memInfo.TryGetValue("MemTotal", out var memTotal) ? memTotal : null,
+            MemoryTotalBytes = memInfo.TryGetValue("MemTotal", out var memTotal) ? memTotal : GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
             MemoryAvailableBytes = memInfo.TryGetValue("MemAvailable", out var memAvailable) ? memAvailable : null,
             ContainerMemoryUsedBytes = containerUsed,
             ContainerMemoryLimitBytes = containerLimit,
