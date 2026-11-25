@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
@@ -29,6 +30,7 @@ public class DiscoveryController : BaseJellyfinApiController
     private readonly IUserManager _userManager;
     private readonly ILibraryManager _libraryManager;
     private readonly ITrailerVideoService _trailers;
+    private readonly ITmdbImageCache _images;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DiscoveryController"/> class.
@@ -37,9 +39,11 @@ public class DiscoveryController : BaseJellyfinApiController
     /// <param name="userManager">The user manager.</param>
     /// <param name="libraryManager">The library manager.</param>
     /// <param name="trailers">The trailer video service.</param>
-    public DiscoveryController(IDiscoveryService discovery, IUserManager userManager, ILibraryManager libraryManager, ITrailerVideoService trailers)
+    /// <param name="images">The cache of TMDb images.</param>
+    public DiscoveryController(IDiscoveryService discovery, IUserManager userManager, ILibraryManager libraryManager, ITrailerVideoService trailers, ITmdbImageCache images)
     {
         _trailers = trailers;
+        _images = images;
         _discovery = discovery;
         _userManager = userManager;
         _libraryManager = libraryManager;
@@ -302,5 +306,34 @@ public class DiscoveryController : BaseJellyfinApiController
         }
 
         return Ok(await _discovery.GetUpcomingAsync(user, start, end, cancellationToken).ConfigureAwait(false));
+    }
+
+    /// <summary>
+    /// Gets a TMDb image (poster or still of an upcoming release) from the server cache, at a small size.
+    /// Open like the images of the library items (a picture cannot send the sign-in header); only TMDb sizes and
+    /// plain TMDb file names are served.
+    /// </summary>
+    /// <param name="size">The TMDb size: w92, w154, w185, w300, w342, w500 or w780.</param>
+    /// <param name="file">The file name on TMDb (the <c>ImagePath</c> of a release, without its slash).</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <response code="200">The image.</response>
+    /// <response code="404">Not a TMDb image, or TMDb does not have it.</response>
+    /// <returns>The image file.</returns>
+    [HttpGet("Images/{size}/{file}")]
+    [AllowAnonymous]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesImageFile]
+    public async Task<ActionResult> GetImage([FromRoute, Required] string size, [FromRoute, Required] string file, CancellationToken cancellationToken = default)
+    {
+        var path = await _images.GetImageAsync(size, file, cancellationToken).ConfigureAwait(false);
+        if (path is null)
+        {
+            return NotFound();
+        }
+
+        // A TMDb file name never changes its picture: browsers keep it for a long time
+        Response.Headers.CacheControl = "public, max-age=2592000, immutable";
+        return PhysicalFile(path, file.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? "image/png" : "image/jpeg");
     }
 }

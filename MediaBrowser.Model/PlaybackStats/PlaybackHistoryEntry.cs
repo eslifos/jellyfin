@@ -131,4 +131,29 @@ public class PlaybackHistoryEntry
     /// Gets or sets the delivered height (resolution).
     /// </summary>
     public int? Height { get; set; }
+
+    /// <summary>
+    /// Gets or sets the kind of library it belongs to (see <see cref="PlaybackCategory"/>).
+    /// </summary>
+    public string? Category { get; set; }
+
+    /// <summary>
+    /// Gets or sets the album of a song, or the book of an audiobook part.
+    /// </summary>
+    public Guid? AlbumId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the album or book name.
+    /// </summary>
+    public string? AlbumName { get; set; }
+
+    /// <summary>
+    /// Gets or sets the artist or author, when it is in the library.
+    /// </summary>
+    public Guid? ArtistId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the artist or author name.
+    /// </summary>
+    public string? ArtistName { get; set; }
 }

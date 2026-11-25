@@ -34,9 +34,15 @@ public class UpcomingRelease
     public string? Overview { get; set; }
 
     /// <summary>
-    /// Gets or sets the poster (or still) URL on TMDb.
+    /// Gets or sets the poster (or still) URL on TMDb, at a small size (w185 posters, w300 stills).
     /// </summary>
     public string? ImageUrl { get; set; }
+
+    /// <summary>
+    /// Gets or sets the TMDb path of the image ("/abc123.jpg"). The server serves it from its cache at any size:
+    /// Discovery/Images/{size}{ImagePath}, so the apps never depend on reaching TMDb.
+    /// </summary>
+    public string? ImagePath { get; set; }
 
     /// <summary>
     /// Gets or sets the backdrop URL.

@@ -36,4 +36,14 @@ public class PlaybackStatsRank
     /// Gets or sets the last time it was played (UTC).
     /// </summary>
     public DateTime? LastPlayedUtc { get; set; }
+
+    /// <summary>
+    /// Gets or sets the item whose picture represents it, when it is not the same as the id.
+    /// </summary>
+    public Guid? ImageId { get; set; }
+
+    /// <summary>
+    /// Gets or sets a second line, like the artist of an album.
+    /// </summary>
+    public string? Subtitle { get; set; }
 }

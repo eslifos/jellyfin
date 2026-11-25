@@ -36,6 +36,12 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     private static readonly TimeSpan _popularityMaxAge = TimeSpan.FromHours(24);
     private const int TmdbLookups = 40;
 
+    /// <summary>Upcoming posters are small cards and calendar thumbnails.</summary>
+    private const string UpcomingPosterSize = "w185";
+
+    /// <summary>Upcoming episode stills are wide cards.</summary>
+    private const string UpcomingStillSize = "w300";
+
     private readonly ILibraryManager _libraryManager;
     private readonly TmdbClientManager _tmdb;
     private readonly IImdbRatingsService _imdb;
@@ -521,8 +527,12 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
 
     private async Task<List<Guid>> BuildTop10Async(bool series, Folder? library, string key, CancellationToken cancellationToken)
     {
-        var language = _config.Configuration.PreferredMetadataLanguage;
-        var country = string.IsNullOrEmpty(_config.Configuration.MetadataCountryCode) ? "US" : _config.Configuration.MetadataCountryCode;
+        var language = library?.GetPreferredMetadataLanguage() ?? _config.Configuration.PreferredMetadataLanguage;
+        var country = library?.GetPreferredMetadataCountryCode() ?? _config.Configuration.MetadataCountryCode;
+        if (string.IsNullOrEmpty(country))
+        {
+            country = "US";
+        }
 
         var query = new InternalItemsQuery
         {
@@ -1104,8 +1114,6 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
     private async Task<List<UpcomingRelease>> BuildUpcomingAsync(CancellationToken cancellationToken)
     {
         var today = DateTime.UtcNow.Date;
-        var language = _config.Configuration.PreferredMetadataLanguage;
-        var country = _config.Configuration.MetadataCountryCode;
         var result = new ConcurrentBag<UpcomingRelease>();
 
         // Next episodes of the series that are still running
@@ -1114,13 +1122,16 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
             .OfType<Series>()
             .Where(s => s.Status != SeriesStatus.Ended)
             .ToList();
-        var lookupLanguage = string.IsNullOrEmpty(language) ? "en" : language;
         var withoutTmdb = 0;
 
         await Parallel.ForEachAsync(series, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken }, async (item, ct) =>
         {
             try
             {
+                // Each title in the language of its own library
+                var language = item.GetPreferredMetadataLanguage();
+                var country = item.GetPreferredMetadataCountryCode();
+                var lookupLanguage = string.IsNullOrEmpty(language) ? "en" : language;
                 if (await ResolveSeriesTmdbAsync(item, lookupLanguage, country, ct).ConfigureAwait(false) is not int id)
                 {
                     Interlocked.Increment(ref withoutTmdb);
@@ -1171,7 +1182,8 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
         {
             try
             {
-                var collection = await _tmdb.GetCollectionAsync(saga.Key, language, null, country, ct).ConfigureAwait(false);
+                var source = saga.First().Movie;
+                var collection = await _tmdb.GetCollectionAsync(saga.Key, source.GetPreferredMetadataLanguage(), null, source.GetPreferredMetadataCountryCode(), ct).ConfigureAwait(false);
                 foreach (var part in collection?.Parts ?? [])
                 {
                     if (part.ReleaseDate is not DateTime date || date.Date < today.AddDays(-30) || owned.Contains(part.Id))
@@ -1186,7 +1198,9 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
                         Title = part.Title ?? string.Empty,
                         ReleaseDate = ToUtcDate(date),
                         Overview = part.Overview,
-                        ImageUrl = _tmdb.GetPosterUrl(part.PosterPath),
+                        // Shown as a small poster: never the original size of TMDb
+                        ImageUrl = _tmdb.GetImageUrl(UpcomingPosterSize, part.PosterPath),
+                        ImagePath = part.PosterPath,
                         CollectionName = collection!.Name,
                         RelatedItemId = saga.OrderByDescending(x => x.Movie.PremiereDate).First().Movie.Id
                     });
@@ -1208,7 +1222,8 @@ public sealed class DiscoveryService : IDiscoveryService, IDisposable
             TmdbId = tmdbId,
             Title = name ?? string.Empty,
             Overview = overview,
-            ImageUrl = _tmdb.GetStillUrl(still),
+            ImageUrl = _tmdb.GetImageUrl(UpcomingStillSize, still),
+            ImagePath = still,
             ReleaseDate = ToUtcDate(date),
             SeriesId = item.Id,
             SeriesName = item.Name,

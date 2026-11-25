@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+using Emby.Server.Implementations.Library;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Audio;
 using MediaBrowser.Controller.Library;
@@ -26,17 +27,20 @@ public sealed partial class AudiobookQuery
     public int? Year { get; set; }
 
     /// <summary>
-    /// Gets or sets the Spanish wanted: Latin American ("latam", the default) or from Spain ("spain"),
-    /// when the folder or file name says so ("Latino", "Castellano"…).
+    /// Gets or sets the Spanish wanted when the library is in Spanish: Latin American ("latam") or from Spain
+    /// ("spain"). The folder or file name decides ("Latino", "Castellano"…), otherwise the country of the library.
     /// </summary>
     public string Variant { get; set; } = SpanishVariant.Latam;
+
+    /// <summary>Gets or sets the language and country of the library.</summary>
+    public MetadataLocale Locale { get; set; } = MetadataLocale.From(null, null);
 
     /// <summary>
     /// The same query with another title.
     /// </summary>
     /// <param name="title">The title to look up.</param>
     /// <returns>A copy with that title.</returns>
-    public AudiobookQuery WithTitle(string title) => new() { Title = title, Author = Author, Year = Year, Variant = Variant };
+    public AudiobookQuery WithTitle(string title) => new() { Title = title, Author = Author, Year = Year, Variant = Variant, Locale = Locale };
 
     /// <summary>
     /// Builds the query of a book.
@@ -47,8 +51,9 @@ public sealed partial class AudiobookQuery
     /// <param name="isFolder">Whether the path is the book's folder (a book in parts).</param>
     /// <param name="artists">Authors from the tags.</param>
     /// <param name="year">Year, when known.</param>
+    /// <param name="locale">The language and country of the library.</param>
     /// <returns>The query, or null when there is nothing to look up.</returns>
-    public static AudiobookQuery? Create(ILibraryManager libraryManager, string? name, string? path, bool isFolder, IEnumerable<string>? artists, int? year)
+    public static AudiobookQuery? Create(ILibraryManager libraryManager, string? name, string? path, bool isFolder, IEnumerable<string>? artists, int? year, MetadataLocale locale)
     {
         var title = Clean(name);
         if (string.IsNullOrEmpty(title) && !string.IsNullOrEmpty(path))
@@ -76,7 +81,8 @@ public sealed partial class AudiobookQuery
 
         var variant = SpanishVariant.Detect(name + " " + path);
         year ??= FindYear(name) ?? (path is null ? null : FindYear(Path.GetFileName(isFolder ? path : Path.GetDirectoryName(path))));
-        return new AudiobookQuery { Title = title, Author = author, Year = year, Variant = variant ?? SpanishVariant.Latam };
+        var usualVariant = locale.Country == "es" ? SpanishVariant.Spain : SpanishVariant.Latam;
+        return new AudiobookQuery { Title = title, Author = author, Year = year, Variant = variant ?? usualVariant, Locale = locale };
     }
 
     /// <summary>
@@ -156,7 +162,7 @@ public sealed partial class AudiobookQuery
     [GeneratedRegex(@"[\(\[\{][^\)\]\}]*[\)\]\}]")]
     private static partial Regex Brackets();
 
-    [GeneratedRegex(@"\b(audiolibro|audiobook|unabridged|abridged|completo|integro|íntegro|narrado por [^-]+|m4b|mp3)\b", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"\b(audiolibro|audiobook|audiolivro|hörbuch|livre audio|unabridged|abridged|completo|integro|íntegro|narrado por [^-]+|m4b|mp3)\b", RegexOptions.IgnoreCase)]
     private static partial Regex Noise();
 
     [GeneratedRegex(@"\s+")]

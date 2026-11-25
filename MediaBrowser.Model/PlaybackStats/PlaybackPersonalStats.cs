@@ -137,4 +137,49 @@ public class PlaybackPersonalStats
     /// Gets or sets the most recent plays.
     /// </summary>
     public IReadOnlyList<PlaybackHistoryEntry> Recent { get; set; } = Array.Empty<PlaybackHistoryEntry>();
+
+    /// <summary>
+    /// Gets or sets the time per kind of library.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> ByCategory { get; set; } = Array.Empty<PlaybackStatsRank>();
+
+    /// <summary>
+    /// Gets or sets the most played artists.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopArtists { get; set; } = Array.Empty<PlaybackStatsRank>();
+
+    /// <summary>
+    /// Gets or sets the most played albums.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopAlbums { get; set; } = Array.Empty<PlaybackStatsRank>();
+
+    /// <summary>
+    /// Gets or sets the most played songs.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopSongs { get; set; } = Array.Empty<PlaybackStatsRank>();
+
+    /// <summary>
+    /// Gets or sets the most played music videos.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopMusicVideos { get; set; } = Array.Empty<PlaybackStatsRank>();
+
+    /// <summary>
+    /// Gets or sets the most played books and audiobooks.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopBooks { get; set; } = Array.Empty<PlaybackStatsRank>();
+
+    /// <summary>
+    /// Gets or sets the distinct songs finished ever.
+    /// </summary>
+    public int SongsFinished { get; set; }
+
+    /// <summary>
+    /// Gets or sets the distinct music videos finished ever.
+    /// </summary>
+    public int MusicVideosFinished { get; set; }
+
+    /// <summary>
+    /// Gets or sets the distinct books finished ever.
+    /// </summary>
+    public int BooksFinished { get; set; }
 }

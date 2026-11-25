@@ -10,14 +10,15 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Emby.Server.Implementations.Library;
 using MediaBrowser.Common.Net;
 using Microsoft.Extensions.Logging;
 
 namespace Emby.Server.Implementations.Audiobooks;
 
 /// <summary>
-/// Looks audiobooks up in free online catalogs, Spanish first:
-/// Audible Spain, Audible US, Apple Books (Spain, US), Google Books (Spanish) and Open Library.
+/// Looks audiobooks up in free online catalogs, in the language and country of the library:
+/// Audible, Apple Books, Google Books and Open Library.
 /// The best match gives the main data; the other catalogs fill what it lacks (synopsis, cover, ISBN…).
 /// </summary>
 public sealed partial class AudiobookCatalog
@@ -26,19 +27,6 @@ public sealed partial class AudiobookCatalog
 
     private static readonly TimeSpan _cacheAge = TimeSpan.FromHours(12);
     private static readonly ConcurrentDictionary<string, (DateTime Built, List<AudiobookMatch> Matches)> _cache = new(StringComparer.Ordinal);
-
-    /// <summary>
-    /// Audible stores: the US one (its Spanish catalog is Latin American) and Spain. There is no Mexican store.
-    /// Both are searched and the edition closest to the wanted Spanish wins.
-    /// </summary>
-    private static readonly (string Region, string Host)[] _audibleRegions =
-    [
-        ("us", "https://api.audible.com"),
-        ("es", "https://api.audible.es")
-    ];
-
-    /// <summary>Apple Books stores with audiobooks (the Mexican store has none in the public search).</summary>
-    private static readonly string[] _appleCountries = ["us", "es"];
 
     private const string AudibleGroups = "contributors,product_attrs,product_desc,product_extended_attrs,series,media,rating,category_ladders";
 
@@ -130,9 +118,9 @@ public sealed partial class AudiobookCatalog
     {
         var found = new List<AudiobookMatch>();
 
-        // Audible first: both stores, the edition in the wanted Spanish wins (Latin American, otherwise Spain)
+        // Audible first: the stores of the library, the edition in its language wins
         var audible = new List<AudiobookMatch>();
-        foreach (var (region, host) in _audibleRegions)
+        foreach (var (region, host) in AudiobookStores.Audible(query.Locale))
         {
             audible.AddRange(await SearchAudibleAsync(host, region, query, cancellationToken).ConfigureAwait(false));
         }
@@ -145,7 +133,7 @@ public sealed partial class AudiobookCatalog
         {
             // Apple Books when Audible doesn't have it
             var apple = new List<AudiobookMatch>();
-            foreach (var country in _appleCountries)
+            foreach (var country in AudiobookStores.Apple(query.Locale))
             {
                 apple.AddRange(await SearchAppleAsync(country, query, cancellationToken).ConfigureAwait(false));
             }
@@ -156,7 +144,7 @@ public sealed partial class AudiobookCatalog
             }
         }
 
-        // Google Books for a Spanish synopsis, ISBN and publisher when missing
+        // Google Books for a synopsis in the language, ISBN and publisher when missing
         if (found.Count == 0 || string.IsNullOrEmpty(found[0].Overview) || string.IsNullOrEmpty(found[0].Publisher))
         {
             if (Best(await SearchGoogleAsync(query, cancellationToken).ConfigureAwait(false)) is { } google)
@@ -187,12 +175,12 @@ public sealed partial class AudiobookCatalog
     public async Task<List<AudiobookMatch>> SearchAllAsync(AudiobookQuery query, int perSource, CancellationToken cancellationToken)
     {
         var lists = new List<List<AudiobookMatch>>();
-        foreach (var (region, host) in _audibleRegions)
+        foreach (var (region, host) in AudiobookStores.Audible(query.Locale))
         {
             lists.Add(await SearchAudibleAsync(host, region, query, cancellationToken).ConfigureAwait(false));
         }
 
-        foreach (var country in _appleCountries)
+        foreach (var country in AudiobookStores.Apple(query.Locale))
         {
             lists.Add(await SearchAppleAsync(country, query, cancellationToken).ConfigureAwait(false));
         }
@@ -209,14 +197,15 @@ public sealed partial class AudiobookCatalog
     /// </summary>
     /// <param name="source">The catalog.</param>
     /// <param name="id">The id in that catalog.</param>
+    /// <param name="locale">The language and country of the library.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>The book, or null.</returns>
-    public async Task<AudiobookMatch?> GetByIdAsync(string source, string id, CancellationToken cancellationToken)
+    public async Task<AudiobookMatch?> GetByIdAsync(string source, string id, MetadataLocale locale, CancellationToken cancellationToken)
     {
         switch (source)
         {
             case AudiobookSources.Audible:
-                foreach (var (region, host) in _audibleRegions)
+                foreach (var (region, host) in AudiobookStores.Audible(locale))
                 {
                     var url = $"{host}/1.0/catalog/products/{Uri.EscapeDataString(id)}?response_groups={AudibleGroups}&image_sizes=500,1024,2400";
                     using var doc = await GetJsonAsync(url, cancellationToken).ConfigureAwait(false);
@@ -230,7 +219,7 @@ public sealed partial class AudiobookCatalog
 
                 return null;
             case AudiobookSources.AppleBooks:
-                foreach (var country in _appleCountries)
+                foreach (var country in AudiobookStores.Apple(locale))
                 {
                     using var doc = await GetJsonAsync($"https://itunes.apple.com/lookup?id={Uri.EscapeDataString(id)}&country={country}", cancellationToken).ConfigureAwait(false);
                     var first = doc is not null && doc.RootElement.TryGetProperty("results", out var results) ? results.EnumerateArray().FirstOrDefault() : default;
@@ -439,7 +428,7 @@ public sealed partial class AudiobookCatalog
             Genres = string.IsNullOrEmpty(genre) ? [] : [genre],
             ImageUrl = artwork is null ? null : ArtworkSize().Replace(artwork, "1400x1400bb"),
             ImageSize = artwork is null ? null : 1400,
-            Language = country == "es" ? "es" : null,
+            Language = AudiobookStores.LanguageOf(country),
             Region = country
         };
     }
@@ -453,7 +442,7 @@ public sealed partial class AudiobookCatalog
             async () =>
             {
                 var q = "intitle:" + query.Title + (string.IsNullOrEmpty(query.Author) ? string.Empty : " inauthor:" + query.Author);
-                var url = $"https://www.googleapis.com/books/v1/volumes?maxResults=10&printType=books&langRestrict=es&q={Uri.EscapeDataString(q)}";
+                var url = $"https://www.googleapis.com/books/v1/volumes?maxResults=10&printType=books&langRestrict={query.Locale.Language}&q={Uri.EscapeDataString(q)}";
                 using var doc = await GetJsonAsync(url, cancellationToken).ConfigureAwait(false);
                 if (doc is null || !doc.RootElement.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
                 {
@@ -541,7 +530,7 @@ public sealed partial class AudiobookCatalog
 
     private async Task<List<AudiobookMatch>> CachedAsync(string source, AudiobookQuery query, Func<Task<List<AudiobookMatch>>> search)
     {
-        var key = source + "|" + query.Variant + "|" + Normalize(query.Title) + "|" + Normalize(query.Author ?? string.Empty);
+        var key = source + "|" + query.Locale.Language + "|" + query.Locale.Country + "|" + query.Variant + "|" + Normalize(query.Title) + "|" + Normalize(query.Author ?? string.Empty);
         if (_cache.TryGetValue(key, out var cached) && DateTime.UtcNow - cached.Built < _cacheAge)
         {
             return cached.Matches.Select(Clone).ToList();
@@ -608,7 +597,7 @@ public sealed partial class AudiobookCatalog
         }
     }
 
-    /// <summary>How well a result matches: the title counts most, the author confirms it, Spanish editions win ties.</summary>
+    /// <summary>How well a result matches: the title counts most, the author confirms it, editions in the language win ties.</summary>
     private static double Score(AudiobookMatch match, AudiobookQuery query)
     {
         var title = TitleSimilarity(query.Title, match.Title);
@@ -629,14 +618,16 @@ public sealed partial class AudiobookCatalog
             score += 0.1;
         }
 
-        score += SpanishVariant.Bonus(match, query.Variant);
+        score += query.Locale.Language == "es"
+            ? SpanishVariant.Bonus(match, query.Variant)
+            : AudiobookStores.IsLanguage(match.Language, query.Locale.Language) ? 0.10 : 0;
 
         if (query.Year is int year && match.ReleaseDate is DateTime date && Math.Abs(date.Year - year) <= 1)
         {
             score += 0.05;
         }
 
-        // Not capped at 1: two editions with the same title are told apart by their Spanish
+        // Not capped at 1: two editions with the same title are told apart by their language
         return Math.Max(score, 0);
     }
 

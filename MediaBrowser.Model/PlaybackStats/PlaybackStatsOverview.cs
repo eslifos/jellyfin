@@ -61,4 +61,34 @@ public class PlaybackStatsOverview
     /// Gets or sets the plays per play method.
     /// </summary>
     public IReadOnlyList<PlaybackStatsRank> PlayMethods { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the time per kind of library.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> ByCategory { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the most played artists.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopArtists { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the most played albums.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopAlbums { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the most played songs.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopSongs { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the most played music videos.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopMusicVideos { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the most played books and audiobooks.
+    /// </summary>
+    public IReadOnlyList<PlaybackStatsRank> TopBooks { get; set; } = [];
 }

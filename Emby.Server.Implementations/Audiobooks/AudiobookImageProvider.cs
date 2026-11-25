@@ -3,6 +3,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using Emby.Server.Implementations.Library;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Entities;
@@ -57,15 +58,16 @@ public class AudiobookImageProvider : IRemoteImageProvider, IHasOrder
     /// <inheritdoc />
     public async Task<IEnumerable<RemoteImageInfo>> GetImages(BaseItem item, CancellationToken cancellationToken)
     {
+        var locale = MetadataLocale.From(item.GetPreferredMetadataLanguage(), item.GetPreferredMetadataCountryCode());
         var query = item switch
         {
-            MusicAlbum album => AudiobookQuery.Create(_libraryManager, album.Name, album.Path, true, album.AlbumArtists, album.ProductionYear),
-            AudioBook book => AudiobookQuery.Create(_libraryManager, book.Name, book.Path, false, book.AlbumArtists.Count > 0 ? book.AlbumArtists : book.Artists, book.ProductionYear),
+            MusicAlbum album => AudiobookQuery.Create(_libraryManager, album.Name, album.Path, true, album.AlbumArtists, album.ProductionYear, locale),
+            AudioBook book => AudiobookQuery.Create(_libraryManager, book.Name, book.Path, false, book.AlbumArtists.Count > 0 ? book.AlbumArtists : book.Artists, book.ProductionYear, locale),
             _ => null
         };
 
         var images = new List<RemoteImageInfo>();
-        var known = await AudiobookMetadata.FindAsync(_catalog, item.ProviderIds, null, cancellationToken).ConfigureAwait(false);
+        var known = await AudiobookMetadata.FindAsync(_catalog, item.ProviderIds, null, locale, cancellationToken).ConfigureAwait(false);
         if (known is not null)
         {
             Add(images, known, 10);

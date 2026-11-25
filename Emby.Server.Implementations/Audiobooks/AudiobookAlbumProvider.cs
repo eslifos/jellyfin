@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using Emby.Server.Implementations.Library;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Entities.Audio;
@@ -50,7 +51,7 @@ public class AudiobookAlbumProvider : IRemoteMetadataProvider<MusicAlbum, AlbumI
             return result;
         }
 
-        var match = await AudiobookMetadata.FindAsync(_catalog, info.ProviderIds, Query(info), cancellationToken).ConfigureAwait(false);
+        var match = await AudiobookMetadata.FindAsync(_catalog, info.ProviderIds, Query(info), MetadataLocale.From(info.MetadataLanguage, info.MetadataCountryCode), cancellationToken).ConfigureAwait(false);
         if (match is not null)
         {
             AudiobookMetadata.Apply(result, match);
@@ -68,7 +69,7 @@ public class AudiobookAlbumProvider : IRemoteMetadataProvider<MusicAlbum, AlbumI
         => _httpClientFactory.CreateClient(NamedClient.Default).GetAsync(url, cancellationToken);
 
     private AudiobookQuery? Query(AlbumInfo info)
-        => AudiobookQuery.Create(_libraryManager, info.Name, info.Path, true, info.AlbumArtists, info.Year);
+        => AudiobookQuery.Create(_libraryManager, info.Name, info.Path, true, info.AlbumArtists, info.Year, MetadataLocale.From(info.MetadataLanguage, info.MetadataCountryCode));
 
     private bool IsBook(AlbumInfo info)
         => !string.IsNullOrEmpty(info.Path)

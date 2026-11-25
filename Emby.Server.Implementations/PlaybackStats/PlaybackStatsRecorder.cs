@@ -1,14 +1,18 @@
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.PlaybackStats;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using AudioItem = MediaBrowser.Controller.Entities.Audio.Audio;
 
 namespace Emby.Server.Implementations.PlaybackStats;
 
@@ -27,20 +31,28 @@ public sealed class PlaybackStatsRecorder : IHostedService, IDisposable
     /// <summary>How often a running play is written to disk.</summary>
     private static readonly TimeSpan _saveInterval = TimeSpan.FromSeconds(60);
 
+    /// <summary>The library is still waking up right after the server starts.</summary>
+    private static readonly TimeSpan _classifyDelay = TimeSpan.FromMinutes(1);
+
     private readonly ISessionManager _sessionManager;
+    private readonly ILibraryManager _libraryManager;
     private readonly PlaybackStatsStore _store;
     private readonly ILogger<PlaybackStatsRecorder> _logger;
     private readonly ConcurrentDictionary<string, ActivePlay> _active = new();
+    private readonly ConcurrentDictionary<string, Guid> _artists = new(StringComparer.OrdinalIgnoreCase);
+    private readonly CancellationTokenSource _stopping = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PlaybackStatsRecorder"/> class.
     /// </summary>
     /// <param name="sessionManager">The session manager.</param>
+    /// <param name="libraryManager">The library manager.</param>
     /// <param name="store">The store.</param>
     /// <param name="logger">The logger.</param>
-    public PlaybackStatsRecorder(ISessionManager sessionManager, PlaybackStatsStore store, ILogger<PlaybackStatsRecorder> logger)
+    public PlaybackStatsRecorder(ISessionManager sessionManager, ILibraryManager libraryManager, PlaybackStatsStore store, ILogger<PlaybackStatsRecorder> logger)
     {
         _sessionManager = sessionManager;
+        _libraryManager = libraryManager;
         _store = store;
         _logger = logger;
     }
@@ -60,12 +72,14 @@ public sealed class PlaybackStatsRecorder : IHostedService, IDisposable
         _sessionManager.PlaybackStart += OnPlaybackStart;
         _sessionManager.PlaybackProgress += OnPlaybackProgress;
         _sessionManager.PlaybackStopped += OnPlaybackStopped;
+        _ = Task.Run(() => ClassifyOlderPlaysAsync(_stopping.Token), CancellationToken.None);
         return Task.CompletedTask;
     }
 
     /// <inheritdoc />
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
+        await _stopping.CancelAsync().ConfigureAwait(false);
         _sessionManager.PlaybackStart -= OnPlaybackStart;
         _sessionManager.PlaybackProgress -= OnPlaybackProgress;
         _sessionManager.PlaybackStopped -= OnPlaybackStopped;
@@ -77,13 +91,12 @@ public sealed class PlaybackStatsRecorder : IHostedService, IDisposable
                 Finish(play, DateTime.UtcNow, null, false);
             }
         }
-
-        return Task.CompletedTask;
     }
 
     /// <inheritdoc />
     public void Dispose()
     {
+        _stopping.Dispose();
         _sessionManager.PlaybackStart -= OnPlaybackStart;
         _sessionManager.PlaybackProgress -= OnPlaybackProgress;
         _sessionManager.PlaybackStopped -= OnPlaybackStopped;
@@ -172,10 +185,100 @@ public sealed class PlaybackStatsRecorder : IHostedService, IDisposable
             RemoteAddress = e.Session.RemoteEndPoint
         };
         ApplyStream(entry, e.Session);
+        Describe(item, entry);
         entry.Id = _store.Insert(entry);
 
         var play = new ActivePlay(entry) { IsPaused = e.IsPaused, LastTickUtc = entry.StartedUtc, LastSavedUtc = entry.StartedUtc };
         _active[key] = play;
+    }
+
+    /// <summary>Says which kind of library the item is from and, for music and books, its album and artist.</summary>
+    private void Describe(BaseItem item, PlaybackHistoryEntry entry)
+    {
+        entry.Category = PlaybackCategory.FromItemType(item.GetBaseItemKind().ToString());
+        try
+        {
+            switch (item)
+            {
+                case AudioItem audio:
+                    // A book stored as a folder of parts is made of plain audio files inside a books library
+                    if (audio is AudioBook || _libraryManager.GetInheritedContentType(audio) == CollectionType.books)
+                    {
+                        entry.Category = PlaybackCategory.Book;
+                    }
+
+                    var album = audio.AlbumEntity;
+                    entry.AlbumId = album?.Id;
+                    entry.AlbumName = album?.Name ?? audio.Album;
+                    entry.ArtistName = audio.AlbumArtists.FirstOrDefault(a => !string.IsNullOrWhiteSpace(a))
+                        ?? audio.Artists.FirstOrDefault(a => !string.IsNullOrWhiteSpace(a));
+                    entry.ArtistId = FindArtist(entry.ArtistName);
+                    break;
+                case MusicVideo video:
+                    entry.ArtistName = video.Artists.FirstOrDefault(a => !string.IsNullOrWhiteSpace(a));
+                    entry.ArtistId = FindArtist(entry.ArtistName);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            // The play still counts, only without its album or artist
+            _logger.LogDebug(ex, "Could not describe item {Id} for the statistics", item.Id);
+        }
+    }
+
+    private Guid? FindArtist(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return null;
+        }
+
+        if (_artists.TryGetValue(name, out var known))
+        {
+            return known;
+        }
+
+        var found = _libraryManager.GetItemList(new InternalItemsQuery
+        {
+            IncludeItemTypes = [BaseItemKind.MusicArtist],
+            Name = name,
+            Limit = 1
+        }).FirstOrDefault();
+        if (found is null)
+        {
+            return null;
+        }
+
+        _artists[name] = found.Id;
+        return found.Id;
+    }
+
+    /// <summary>The plays recorded before categories existed get theirs once; items no longer in the library keep their type.</summary>
+    private async Task ClassifyOlderPlaysAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(_classifyDelay, cancellationToken).ConfigureAwait(false);
+            foreach (var id in _store.GetUnclassifiedItems())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_libraryManager.GetItemById(id) is { } item)
+                {
+                    var described = new PlaybackHistoryEntry();
+                    Describe(item, described);
+                    _store.SetClassification(id, described);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The server is stopping: the rest is done on the next start
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not classify the older playback statistics");
+        }
     }
 
     private void Finish(ActivePlay play, DateTime now, long? positionTicks, bool playedToCompletion)

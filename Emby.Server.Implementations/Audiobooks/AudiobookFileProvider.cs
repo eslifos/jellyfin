@@ -3,6 +3,7 @@ using System.IO;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using Emby.Server.Implementations.Library;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
@@ -50,7 +51,7 @@ public class AudiobookFileProvider : IRemoteMetadataProvider<AudioBook, SongInfo
             return result;
         }
 
-        var match = await AudiobookMetadata.FindAsync(_catalog, info.ProviderIds, Query(info), cancellationToken).ConfigureAwait(false);
+        var match = await AudiobookMetadata.FindAsync(_catalog, info.ProviderIds, Query(info), MetadataLocale.From(info.MetadataLanguage, info.MetadataCountryCode), cancellationToken).ConfigureAwait(false);
         if (match is not null)
         {
             AudiobookMetadata.Apply(result, match);
@@ -78,7 +79,7 @@ public class AudiobookFileProvider : IRemoteMetadataProvider<AudioBook, SongInfo
         }
 
         var artists = info.AlbumArtists is { Count: > 0 } ? info.AlbumArtists : info.Artists;
-        return AudiobookQuery.Create(_libraryManager, name, info.Path, false, artists, info.Year);
+        return AudiobookQuery.Create(_libraryManager, name, info.Path, false, artists, info.Year, MetadataLocale.From(info.MetadataLanguage, info.MetadataCountryCode));
     }
 
     private static bool IsGenericName(string name)

@@ -21,7 +21,22 @@ public class PlaybackStatsDay
     public long MovieSeconds { get; set; }
 
     /// <summary>
-    /// Gets or sets the seconds of everything else (music, live TV...).
+    /// Gets or sets the seconds of songs.
+    /// </summary>
+    public long MusicSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the seconds of music videos.
+    /// </summary>
+    public long MusicVideoSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the seconds of books and audiobooks.
+    /// </summary>
+    public long BookSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the seconds of everything else (live TV, home videos...).
     /// </summary>
     public long OtherSeconds { get; set; }
 

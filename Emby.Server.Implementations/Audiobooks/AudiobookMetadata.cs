@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Emby.Server.Implementations.Library;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Audio;
@@ -30,16 +31,17 @@ public static partial class AudiobookMetadata
     /// <param name="catalog">The catalog.</param>
     /// <param name="providerIds">Ids the item already has.</param>
     /// <param name="query">Title and author.</param>
+    /// <param name="locale">The language and country of the library.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>The book, or null.</returns>
-    public static async Task<AudiobookMatch?> FindAsync(AudiobookCatalog catalog, IReadOnlyDictionary<string, string>? providerIds, AudiobookQuery? query, CancellationToken cancellationToken)
+    public static async Task<AudiobookMatch?> FindAsync(AudiobookCatalog catalog, IReadOnlyDictionary<string, string>? providerIds, AudiobookQuery? query, MetadataLocale locale, CancellationToken cancellationToken)
     {
         if (providerIds is not null)
         {
             foreach (var source in _byIdSources)
             {
                 if (providerIds.TryGetValue(source, out var id) && !string.IsNullOrEmpty(id)
-                    && await catalog.GetByIdAsync(source, id, cancellationToken).ConfigureAwait(false) is { } byId)
+                    && await catalog.GetByIdAsync(source, id, locale, cancellationToken).ConfigureAwait(false) is { } byId)
                 {
                     return byId;
                 }

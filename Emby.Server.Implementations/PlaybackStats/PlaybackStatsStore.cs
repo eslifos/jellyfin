@@ -18,7 +18,10 @@ namespace Emby.Server.Implementations.PlaybackStats;
 /// </summary>
 public sealed class PlaybackStatsStore : IPlaybackStatsService
 {
-    private const string Columns = "Id, UserId, UserName, ItemId, ItemName, ItemType, SeriesId, SeriesName, ParentIndexNumber, IndexNumber, ProductionYear, RunTimeTicks, StartedUtc, StoppedUtc, WatchedSeconds, PositionTicks, Completed, Client, DeviceName, RemoteAddress, PlayMethod, TranscodeReasons, VideoCodec, AudioCodec, Height";
+    private const string Columns = "Id, UserId, UserName, ItemId, ItemName, ItemType, SeriesId, SeriesName, ParentIndexNumber, IndexNumber, ProductionYear, RunTimeTicks, StartedUtc, StoppedUtc, WatchedSeconds, PositionTicks, Completed, Client, DeviceName, RemoteAddress, PlayMethod, TranscodeReasons, VideoCodec, AudioCodec, Height, Category, AlbumId, AlbumName, ArtistId, ArtistName";
+
+    /// <summary>The category of a row; rows from before categories existed get it from their item type.</summary>
+    private const string CategorySql = "COALESCE(Category, CASE ItemType WHEN 'Episode' THEN 'Episode' WHEN 'Movie' THEN 'Movie' WHEN 'Audio' THEN 'Music' WHEN 'MusicVideo' THEN 'MusicVideo' WHEN 'AudioBook' THEN 'Book' WHEN 'Book' THEN 'Book' ELSE 'Other' END)";
 
     private readonly ILogger<PlaybackStatsStore> _logger;
     private readonly string _connectionString;
@@ -54,7 +57,7 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
         {
             using var connection = Open();
             using var cmd = connection.CreateCommand();
-            cmd.CommandText = "INSERT INTO Plays (" + Columns[4..] + ") VALUES (@UserId, @UserName, @ItemId, @ItemName, @ItemType, @SeriesId, @SeriesName, @ParentIndexNumber, @IndexNumber, @ProductionYear, @RunTimeTicks, @StartedUtc, @StoppedUtc, @WatchedSeconds, @PositionTicks, @Completed, @Client, @DeviceName, @RemoteAddress, @PlayMethod, @TranscodeReasons, @VideoCodec, @AudioCodec, @Height); SELECT last_insert_rowid();";
+            cmd.CommandText = "INSERT INTO Plays (" + Columns[4..] + ") VALUES (@UserId, @UserName, @ItemId, @ItemName, @ItemType, @SeriesId, @SeriesName, @ParentIndexNumber, @IndexNumber, @ProductionYear, @RunTimeTicks, @StartedUtc, @StoppedUtc, @WatchedSeconds, @PositionTicks, @Completed, @Client, @DeviceName, @RemoteAddress, @PlayMethod, @TranscodeReasons, @VideoCodec, @AudioCodec, @Height, @Category, @AlbumId, @AlbumName, @ArtistId, @ArtistName); SELECT last_insert_rowid();";
             Bind(cmd, entry);
             return (long)cmd.ExecuteScalar()!;
         }
@@ -111,6 +114,43 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
         }
     }
 
+    /// <summary>
+    /// Gets the items of the plays recorded before categories existed.
+    /// </summary>
+    /// <returns>The distinct item ids.</returns>
+    public IReadOnlyList<Guid> GetUnclassifiedItems()
+    {
+        using var connection = Open();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT DISTINCT ItemId FROM Plays WHERE Category IS NULL";
+        using var reader = cmd.ExecuteReader();
+        var ids = new List<Guid>();
+        while (reader.Read())
+        {
+            ids.Add(Guid.Parse(reader.GetString(0)));
+        }
+
+        return ids;
+    }
+
+    /// <summary>
+    /// Fills the category, album and artist of the older plays of an item.
+    /// </summary>
+    /// <param name="itemId">The item.</param>
+    /// <param name="described">An entry with the category, album and artist.</param>
+    public void SetClassification(Guid itemId, PlaybackHistoryEntry described)
+    {
+        lock (_writeLock)
+        {
+            using var connection = Open();
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "UPDATE Plays SET Category = @Category, AlbumId = @AlbumId, AlbumName = @AlbumName, ArtistId = @ArtistId, ArtistName = @ArtistName WHERE ItemId = @ItemId AND Category IS NULL";
+            cmd.Parameters.AddWithValue("@ItemId", itemId.ToString());
+            BindClassification(cmd, described);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
     /// <inheritdoc />
     public PlaybackStatsOverview GetOverview(int days, string? timeZone)
     {
@@ -142,12 +182,7 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
             if (daily.TryGetValue(local.Date, out var day))
             {
                 day.Plays++;
-                switch (Kind(r.ItemType))
-                {
-                    case "Episode": day.EpisodeSeconds += r.WatchedSeconds; break;
-                    case "Movie": day.MovieSeconds += r.WatchedSeconds; break;
-                    default: day.OtherSeconds += r.WatchedSeconds; break;
-                }
+                AddSeconds(day, r);
             }
         }
 
@@ -160,10 +195,16 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
             PlaysByHour = byHour,
             SecondsByWeekday = byWeekday,
             TopUsers = Rank(current, r => r.UserId.ToString(), r => r.UserId, r => r.UserName, 10),
-            TopSeries = Rank(current.Where(r => Kind(r.ItemType) == "Episode" && r.SeriesId.HasValue), r => r.SeriesId!.Value.ToString(), r => r.SeriesId, r => r.SeriesName, 10),
-            TopMovies = Rank(current.Where(r => Kind(r.ItemType) == "Movie"), r => r.ItemId.ToString(), r => r.ItemId, r => r.ProductionYear is int y ? $"{r.ItemName} ({y})" : r.ItemName, 10),
+            TopSeries = Rank(current.Where(r => r.Category == PlaybackCategory.Episode && r.SeriesId.HasValue), r => r.SeriesId!.Value.ToString(), r => r.SeriesId, r => r.SeriesName, 10),
+            TopMovies = Rank(current.Where(r => r.Category == PlaybackCategory.Movie), r => r.ItemId.ToString(), r => r.ItemId, r => r.ProductionYear is int y ? $"{r.ItemName} ({y})" : r.ItemName, 10),
             TopClients = Rank(current, r => r.Client ?? "?", _ => null, r => r.Client, 8),
-            PlayMethods = Rank(current, r => r.PlayMethod ?? "Unknown", _ => null, r => r.PlayMethod ?? "Unknown", 5)
+            PlayMethods = Rank(current, r => r.PlayMethod ?? "Unknown", _ => null, r => r.PlayMethod ?? "Unknown", 5),
+            ByCategory = ByCategory(current),
+            TopArtists = TopArtists(current, 10),
+            TopAlbums = TopAlbums(current, 10),
+            TopSongs = TopSongs(current, 10),
+            TopMusicVideos = TopMusicVideos(current, 10),
+            TopBooks = TopBooks(current, 10)
         };
     }
 
@@ -178,6 +219,11 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
                 cmd.Parameters.AddWithValue("@UserId", userId.Value.ToString());
             }
 
+            if (PlaybackCategory.IsKnown(itemType))
+            {
+                cmd.Parameters.AddWithValue("@Category", itemType);
+            }
+
             if (!string.IsNullOrEmpty(searchTerm))
             {
                 cmd.Parameters.AddWithValue("@Search", "%" + searchTerm + "%");
@@ -189,16 +235,14 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
             where.Add("UserId = @UserId");
         }
 
-        switch (itemType)
+        if (PlaybackCategory.IsKnown(itemType))
         {
-            case "Episode": where.Add("ItemType = 'Episode'"); break;
-            case "Movie": where.Add("ItemType = 'Movie'"); break;
-            case "Other": where.Add("ItemType NOT IN ('Episode', 'Movie')"); break;
+            where.Add(CategorySql + " = @Category");
         }
 
         if (!string.IsNullOrEmpty(searchTerm))
         {
-            where.Add("(ItemName LIKE @Search OR SeriesName LIKE @Search OR UserName LIKE @Search OR Client LIKE @Search OR DeviceName LIKE @Search)");
+            where.Add("(ItemName LIKE @Search OR SeriesName LIKE @Search OR AlbumName LIKE @Search OR ArtistName LIKE @Search OR UserName LIKE @Search OR Client LIKE @Search OR DeviceName LIKE @Search)");
         }
 
         var whereSql = where.Count > 0 ? "WHERE " + string.Join(" AND ", where) : string.Empty;
@@ -355,10 +399,13 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
         // All time totals.
         stats.TotalPlays = plays.Count;
         stats.TotalWatchedSeconds = plays.Sum(p => p.WatchedSeconds);
-        stats.TotalEpisodeSeconds = plays.Where(p => Kind(p.ItemType) == "Episode").Sum(p => p.WatchedSeconds);
-        stats.TotalMovieSeconds = plays.Where(p => Kind(p.ItemType) == "Movie").Sum(p => p.WatchedSeconds);
-        stats.EpisodesFinished = plays.Where(p => p.Completed && Kind(p.ItemType) == "Episode").Select(p => p.ItemId).Distinct().Count();
-        stats.MoviesFinished = plays.Where(p => p.Completed && Kind(p.ItemType) == "Movie").Select(p => p.ItemId).Distinct().Count();
+        stats.TotalEpisodeSeconds = plays.Where(p => p.Category == PlaybackCategory.Episode).Sum(p => p.WatchedSeconds);
+        stats.TotalMovieSeconds = plays.Where(p => p.Category == PlaybackCategory.Movie).Sum(p => p.WatchedSeconds);
+        stats.EpisodesFinished = plays.Where(p => p.Completed && p.Category == PlaybackCategory.Episode).Select(p => p.ItemId).Distinct().Count();
+        stats.MoviesFinished = plays.Where(p => p.Completed && p.Category == PlaybackCategory.Movie).Select(p => p.ItemId).Distinct().Count();
+        stats.SongsFinished = plays.Where(p => p.Completed && p.Category == PlaybackCategory.Music).Select(p => p.ItemId).Distinct().Count();
+        stats.MusicVideosFinished = plays.Where(p => p.Completed && p.Category == PlaybackCategory.MusicVideo).Select(p => p.ItemId).Distinct().Count();
+        stats.BooksFinished = plays.Where(p => p.Completed && p.Category == PlaybackCategory.Book).Select(p => p.AlbumId ?? p.ItemId).Distinct().Count();
         stats.ActiveDays = days.Count;
         stats.FirstPlayUtc = plays[0].StartedUtc;
 
@@ -380,27 +427,88 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
             if (daily.TryGetValue(localDays[i], out var day))
             {
                 day.Plays++;
-                switch (Kind(p.ItemType))
-                {
-                    case "Episode": day.EpisodeSeconds += p.WatchedSeconds; break;
-                    case "Movie": day.MovieSeconds += p.WatchedSeconds; break;
-                    default: day.OtherSeconds += p.WatchedSeconds; break;
-                }
+                AddSeconds(day, p);
             }
         }
 
         stats.Daily = daily.Values.ToList();
         stats.PlaysByHour = byHour;
         stats.SecondsByWeekday = byWeekday;
-        stats.TopSeries = Rank(plays.Where(r => Kind(r.ItemType) == "Episode" && r.SeriesId.HasValue), r => r.SeriesId!.Value.ToString(), r => r.SeriesId, r => r.SeriesName, 8);
-        stats.TopMovies = Rank(plays.Where(r => Kind(r.ItemType) == "Movie"), r => r.ItemId.ToString(), r => r.ItemId, r => r.ProductionYear is int y ? $"{r.ItemName} ({y})" : r.ItemName, 8);
+        stats.TopSeries = Rank(plays.Where(r => r.Category == PlaybackCategory.Episode && r.SeriesId.HasValue), r => r.SeriesId!.Value.ToString(), r => r.SeriesId, r => r.SeriesName, 8);
+        stats.TopMovies = Rank(plays.Where(r => r.Category == PlaybackCategory.Movie), r => r.ItemId.ToString(), r => r.ItemId, r => r.ProductionYear is int y ? $"{r.ItemName} ({y})" : r.ItemName, 8);
         stats.TopClients = Rank(plays, r => r.Client ?? "?", _ => null, r => r.Client, 5);
         stats.Recent = plays.AsEnumerable().Reverse().Take(12).ToList();
+        stats.ByCategory = ByCategory(plays);
+        stats.TopArtists = TopArtists(plays, 8);
+        stats.TopAlbums = TopAlbums(plays, 8);
+        stats.TopSongs = TopSongs(plays, 8);
+        stats.TopMusicVideos = TopMusicVideos(plays, 8);
+        stats.TopBooks = TopBooks(plays, 8);
 
         return stats;
     }
 
-    private static string Kind(string? itemType) => itemType is "Episode" or "Movie" ? itemType : "Other";
+    private static void AddSeconds(PlaybackStatsDay day, PlaybackHistoryEntry play)
+    {
+        switch (play.Category)
+        {
+            case PlaybackCategory.Episode: day.EpisodeSeconds += play.WatchedSeconds; break;
+            case PlaybackCategory.Movie: day.MovieSeconds += play.WatchedSeconds; break;
+            case PlaybackCategory.Music: day.MusicSeconds += play.WatchedSeconds; break;
+            case PlaybackCategory.MusicVideo: day.MusicVideoSeconds += play.WatchedSeconds; break;
+            case PlaybackCategory.Book: day.BookSeconds += play.WatchedSeconds; break;
+            default: day.OtherSeconds += play.WatchedSeconds; break;
+        }
+    }
+
+    private static List<PlaybackStatsRank> ByCategory(IEnumerable<PlaybackHistoryEntry> rows)
+        => Rank(rows, r => r.Category!, _ => null, r => r.Category, 6);
+
+    private static List<PlaybackStatsRank> TopArtists(IEnumerable<PlaybackHistoryEntry> rows, int take)
+        => Rank(
+            rows.Where(r => r.Category == PlaybackCategory.Music && !string.IsNullOrEmpty(r.ArtistName)),
+            r => r.ArtistName!.ToUpperInvariant(),
+            r => r.ArtistId,
+            r => r.ArtistName,
+            take);
+
+    private static List<PlaybackStatsRank> TopAlbums(IEnumerable<PlaybackHistoryEntry> rows, int take)
+        => Rank(
+            rows.Where(r => r.Category == PlaybackCategory.Music && r.AlbumId.HasValue),
+            r => r.AlbumId!.Value.ToString(),
+            r => r.AlbumId,
+            r => r.AlbumName,
+            take,
+            subtitle: r => r.ArtistName);
+
+    private static List<PlaybackStatsRank> TopSongs(IEnumerable<PlaybackHistoryEntry> rows, int take)
+        => Rank(
+            rows.Where(r => r.Category == PlaybackCategory.Music),
+            r => r.ItemId.ToString(),
+            r => r.ItemId,
+            r => r.ItemName,
+            take,
+            r => r.AlbumId,
+            r => r.ArtistName);
+
+    private static List<PlaybackStatsRank> TopMusicVideos(IEnumerable<PlaybackHistoryEntry> rows, int take)
+        => Rank(
+            rows.Where(r => r.Category == PlaybackCategory.MusicVideo),
+            r => r.ItemId.ToString(),
+            r => r.ItemId,
+            r => r.ItemName,
+            take,
+            subtitle: r => r.ArtistName);
+
+    // A book in parts counts as one book
+    private static List<PlaybackStatsRank> TopBooks(IEnumerable<PlaybackHistoryEntry> rows, int take)
+        => Rank(
+            rows.Where(r => r.Category == PlaybackCategory.Book),
+            r => (r.AlbumId ?? r.ItemId).ToString(),
+            r => r.AlbumId ?? r.ItemId,
+            r => r.AlbumName ?? r.ItemName,
+            take,
+            subtitle: r => r.ArtistName);
 
     private static TimeZoneInfo ResolveZone(string? timeZone)
     {
@@ -443,7 +551,9 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
         Func<PlaybackHistoryEntry, string> key,
         Func<PlaybackHistoryEntry, Guid?> id,
         Func<PlaybackHistoryEntry, string?> name,
-        int take)
+        int take,
+        Func<PlaybackHistoryEntry, Guid?>? imageId = null,
+        Func<PlaybackHistoryEntry, string?>? subtitle = null)
     {
         return rows
             .GroupBy(key)
@@ -457,7 +567,9 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
                     Plays = g.Count(),
                     WatchedSeconds = g.Sum(r => r.WatchedSeconds),
                     Users = g.Select(r => r.UserId).Distinct().Count(),
-                    LastPlayedUtc = last.StoppedUtc ?? last.StartedUtc
+                    LastPlayedUtc = last.StoppedUtc ?? last.StartedUtc,
+                    ImageId = imageId?.Invoke(last),
+                    Subtitle = subtitle?.Invoke(last)
                 };
             })
             .OrderByDescending(r => r.WatchedSeconds)
@@ -499,6 +611,16 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
         cmd.Parameters.AddWithValue("@VideoCodec", Db(e.VideoCodec));
         cmd.Parameters.AddWithValue("@AudioCodec", Db(e.AudioCodec));
         cmd.Parameters.AddWithValue("@Height", Db(e.Height));
+        BindClassification(cmd, e);
+    }
+
+    private static void BindClassification(SqliteCommand cmd, PlaybackHistoryEntry e)
+    {
+        cmd.Parameters.AddWithValue("@Category", Db(e.Category));
+        cmd.Parameters.AddWithValue("@AlbumId", Db(e.AlbumId?.ToString()));
+        cmd.Parameters.AddWithValue("@AlbumName", Db(e.AlbumName));
+        cmd.Parameters.AddWithValue("@ArtistId", Db(e.ArtistId?.ToString()));
+        cmd.Parameters.AddWithValue("@ArtistName", Db(e.ArtistName));
     }
 
     private static PlaybackHistoryEntry Read(SqliteDataReader r)
@@ -534,7 +656,12 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
             TranscodeReasons = S(r, 21),
             VideoCodec = S(r, 22),
             AudioCodec = S(r, 23),
-            Height = I(r, 24)
+            Height = I(r, 24),
+            Category = S(r, 25) ?? PlaybackCategory.FromItemType(S(r, 5)),
+            AlbumId = G(r, 26),
+            AlbumName = S(r, 27),
+            ArtistId = G(r, 28),
+            ArtistName = S(r, 29)
         };
     }
 
@@ -552,6 +679,31 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
         }
 
         return list;
+    }
+
+    /// <summary>Databases created by earlier versions get the new columns; their rows stay as they were.</summary>
+    private static void AddMissingColumns(SqliteConnection connection)
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var info = connection.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(Plays)";
+            using var reader = info.ExecuteReader();
+            while (reader.Read())
+            {
+                existing.Add(reader.GetString(1));
+            }
+        }
+
+        foreach (var column in new[] { "Category", "AlbumId", "AlbumName", "ArtistId", "ArtistName" })
+        {
+            if (!existing.Contains(column))
+            {
+                using var add = connection.CreateCommand();
+                add.CommandText = "ALTER TABLE Plays ADD COLUMN " + column + " TEXT";
+                add.ExecuteNonQuery();
+            }
+        }
     }
 
     private SqliteConnection Open()
@@ -592,13 +744,19 @@ public sealed class PlaybackStatsStore : IPlaybackStatsService
                             TranscodeReasons TEXT,
                             VideoCodec TEXT,
                             AudioCodec TEXT,
-                            Height INTEGER
+                            Height INTEGER,
+                            Category TEXT,
+                            AlbumId TEXT,
+                            AlbumName TEXT,
+                            ArtistId TEXT,
+                            ArtistName TEXT
                         );
                         CREATE INDEX IF NOT EXISTS IX_Plays_StartedUtc ON Plays (StartedUtc);
                         CREATE INDEX IF NOT EXISTS IX_Plays_UserId ON Plays (UserId);
                         CREATE INDEX IF NOT EXISTS IX_Plays_SeriesId ON Plays (SeriesId);
                         """;
                     cmd.ExecuteNonQuery();
+                    AddMissingColumns(connection);
                     _initialized = true;
                 }
             }
