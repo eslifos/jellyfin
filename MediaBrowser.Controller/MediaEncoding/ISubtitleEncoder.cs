@@ -55,23 +55,27 @@ namespace MediaBrowser.Controller.MediaEncoding
         Task<string> GetSubtitleFilePath(MediaStream subtitleStream, MediaSourceInfo mediaSource, CancellationToken cancellationToken);
 
         /// <summary>
-        /// Extracts all extractable subtitles (text and pgs).
+        /// Extracts all extractable subtitles (text and pgs). The extraction runs on its own: cancelling only stops
+        /// waiting for it (a request dropped by a proxy does not throw away the work), and asking again while it runs
+        /// waits for the same one.
         /// </summary>
         /// <param name="mediaSource">The mediaSource.</param>
-        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <param name="cancellationToken">Stops waiting.</param>
         /// <returns>Task.</returns>
         Task ExtractAllExtractableSubtitles(MediaSourceInfo mediaSource, CancellationToken cancellationToken);
 
         /// <summary>
         /// Gets the part of a text subtitle that is already extracted from the video file, so players can show it
-        /// while the extraction (which reads the whole file) is still running.
+        /// while the extraction (which reads the whole file) is still running. Starts the extraction when nobody did.
         /// </summary>
         /// <param name="item">Item to use.</param>
         /// <param name="mediaSourceId">Media source.</param>
         /// <param name="subtitleStreamIndex">Subtitle stream to use.</param>
         /// <param name="outputFormat">Output format to use.</param>
+        /// <param name="retry">Try again an extraction that failed.</param>
+        /// <param name="positionTicks">Where the video is: past the part read so far, the subtitle is also read from there.</param>
         /// <param name="cancellationToken">The cancellation token for the operation.</param>
-        /// <returns>The subtitle so far (null when nothing is extracted yet) and whether the extraction is complete.</returns>
-        Task<(Stream Content, bool Complete)> GetPartialSubtitles(BaseItem item, string mediaSourceId, int subtitleStreamIndex, string outputFormat, CancellationToken cancellationToken);
+        /// <returns>The subtitle so far and where its extraction stands.</returns>
+        Task<PartialSubtitles> GetPartialSubtitles(BaseItem item, string mediaSourceId, int subtitleStreamIndex, string outputFormat, bool retry, long? positionTicks, CancellationToken cancellationToken);
     }
 }

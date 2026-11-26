@@ -91,6 +91,7 @@ namespace Emby.Server.Implementations.Library
         private readonly DotIgnoreIgnoreRule _dotIgnoreIgnoreRule;
         private readonly IMediaStreamRepository _mediaStreamRepository;
         private readonly Lazy<IExternalDataManager> _externalDataManagerFactory;
+        private readonly IGenreNormalizer _genreNormalizer;
 
         /// <summary>
         /// The _root folder sync lock.
@@ -135,6 +136,7 @@ namespace Emby.Server.Implementations.Library
         /// <param name="localization">The localization manager.</param>
         /// <param name="mediaStreamRepository">The media stream repository.</param>
         /// <param name="externalDataManagerFactory">The external data manager (lazy, to break the DI cycle through ChapterManager).</param>
+        /// <param name="genreNormalizer">Keeps the genres of each library in its language.</param>
         public LibraryManager(
             IServerApplicationHost appHost,
             ILoggerFactory loggerFactory,
@@ -159,8 +161,10 @@ namespace Emby.Server.Implementations.Library
             DotIgnoreIgnoreRule dotIgnoreIgnoreRule,
             ILocalizationManager localization,
             IMediaStreamRepository mediaStreamRepository,
-            Lazy<IExternalDataManager> externalDataManagerFactory)
+            Lazy<IExternalDataManager> externalDataManagerFactory,
+            IGenreNormalizer genreNormalizer)
         {
+            _genreNormalizer = genreNormalizer;
             _appHost = appHost;
             _logger = loggerFactory.CreateLogger<LibraryManager>();
             _taskManager = taskManager;
@@ -2515,6 +2519,8 @@ namespace Emby.Server.Implementations.Library
             {
                 // Parental controls filter on the stored score, so it has to match the ratings being saved.
                 item.OnMetadataChanged();
+                // Genres in the language of the library ("Comedy" from an NFO file becomes "Comedia")
+                _genreNormalizer.Normalize(item);
 
                 if (item is Video video && video.LocalAlternateVersions.Length > 0)
                 {
@@ -2724,6 +2730,8 @@ namespace Emby.Server.Implementations.Library
             {
                 // Parental controls filter on the stored score, so it has to match the ratings being saved.
                 item.OnMetadataChanged();
+                // Genres in the language of the library, before the metadata savers write them (NFO files included)
+                _genreNormalizer.Normalize(item);
 
                 item.DateLastSaved = DateTime.UtcNow;
                 await RunMetadataSavers(item, updateReason).ConfigureAwait(false);

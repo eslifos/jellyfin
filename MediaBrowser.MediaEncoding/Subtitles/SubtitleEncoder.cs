@@ -1,6 +1,7 @@
 #pragma warning disable CS1591
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -53,6 +54,37 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             o.PoolSize = 20;
             o.PoolInitialFill = 1;
         });
+
+        /// <summary>
+        /// Times the playback speed at which the file is read when its subtitles are extracted. Reading only the
+        /// subtitles, ffmpeg does not go faster than twice the playback speed whatever the value (measured).
+        /// </summary>
+        private const int ExtractionReadRate = 2;
+
+        /// <summary>Seconds of video read at once at the start, so the first lines are there right away.</summary>
+        private const int ExtractionInitialBurstSeconds = 120;
+
+        /// <summary>ffmpeg reads its input at a limited pace from this version on.</summary>
+        private static readonly Version _minFFmpegReadRate = new(5, 0);
+
+        /// <summary>ffmpeg reads a first part at once before the limited pace from this version on.</summary>
+        private static readonly Version _minFFmpegReadRateBurst = new(6, 1);
+
+        /// <summary>A jump past the part read by less than this is left to the reading from the start.</summary>
+        private static readonly TimeSpan SeekWindowLead = TimeSpan.FromSeconds(90);
+
+        /// <summary>A reading from where the video jumped to starts this much before it.</summary>
+        private static readonly TimeSpan SeekWindowBack = TimeSpan.FromSeconds(30);
+
+        /// <summary>The readings from where the video jumped ahead, by file and subtitle stream.</summary>
+        private readonly ConcurrentDictionary<string, SeekWindow> _seekWindows = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>The extractions running now, by video file: whoever asks waits for the same one.</summary>
+        private readonly Dictionary<string, Task> _runningExtractions = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Lock _extractionsLock = new();
+
+        /// <summary>When the last extraction of a file failed (shown to players, cleared by a retry or a success).</summary>
+        private readonly ConcurrentDictionary<string, DateTime> _failedExtractions = new(StringComparer.OrdinalIgnoreCase);
 
         public SubtitleEncoder(
             ILogger<SubtitleEncoder> logger,
@@ -153,7 +185,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         }
 
         /// <inheritdoc />
-        public async Task<(Stream? Content, bool Complete)> GetPartialSubtitles(BaseItem item, string mediaSourceId, int subtitleStreamIndex, string outputFormat, CancellationToken cancellationToken)
+        public async Task<PartialSubtitles> GetPartialSubtitles(BaseItem item, string mediaSourceId, int subtitleStreamIndex, string outputFormat, bool retry, long? positionTicks, CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(item);
 
@@ -161,31 +193,71 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             var mediaSource = mediaSources.FirstOrDefault(i => string.Equals(i.Id, mediaSourceId, StringComparison.OrdinalIgnoreCase));
             var subtitleStream = mediaSource?.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Subtitle && i.Index == subtitleStreamIndex);
 
-            // Only text subtitles inside the video file are extracted to .srt (written little by little)
+            // Only text subtitles inside the video file are read out of it
             if (mediaSource is null
-                || subtitleStream is null
-                || (subtitleStream.IsExternal && !subtitleStream.Path.EndsWith(".mks", StringComparison.OrdinalIgnoreCase))
-                || !string.Equals(GetExtractableSubtitleFileExtension(subtitleStream), "srt", StringComparison.OrdinalIgnoreCase))
+                || subtitleStream is not { IsTextSubtitleStream: true, IsExtractableSubtitleStream: true }
+                || (subtitleStream.IsExternal && !subtitleStream.Path.EndsWith(".mks", StringComparison.OrdinalIgnoreCase)))
             {
-                return (null, true);
+                return new PartialSubtitles(null, SubtitleExtractionState.NotNeeded);
             }
 
-            var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, ".srt");
+            var extension = GetExtractableSubtitleFileExtension(subtitleStream);
+            var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, "." + extension);
             if (outputPath is null)
             {
-                return (null, true);
+                return new PartialSubtitles(null, SubtitleExtractionState.NotNeeded);
             }
 
             var sourcePath = string.IsNullOrEmpty(subtitleStream.Path) ? mediaSource.Path : subtitleStream.Path;
             var complete = IsCachedSubtitleFresh(outputPath, sourcePath);
-            if (!File.Exists(outputPath))
+            var state = complete ? SubtitleExtractionState.Complete : ExtractionStateOf(mediaSource, retry);
+
+            // Only .srt is written in a way that can be read while it grows; the rest is shown once it is complete
+            if (!string.Equals(extension, "srt", StringComparison.OrdinalIgnoreCase))
             {
-                return (null, complete);
+                return new PartialSubtitles(null, state);
             }
 
-            // ffmpeg may still be appending to the file: read what is there and keep only the finished blocks
+            var windowKey = WindowKey(mediaSource, subtitleStream.Index);
+            var subtitle = await ReadSrt(outputPath, complete, cancellationToken).ConfigureAwait(false);
+            if (complete)
+            {
+                StopSeekWindow(windowKey);
+            }
+            else if (state == SubtitleExtractionState.Extracting)
+            {
+                // Like a player that jumps ahead: what is past the part read so far is read from where the video is
+                var readUpTo = subtitle?.Paragraphs.Count > 0 ? subtitle.Paragraphs[^1].EndTime.TimeSpan.Ticks : 0;
+                var window = SeekWindowFor(mediaSource, subtitleStream, windowKey, readUpTo, positionTicks);
+                if (window is not null)
+                {
+                    var ahead = await ReadSrt(window.Path, false, cancellationToken).ConfigureAwait(false);
+                    subtitle = Merge(subtitle, ahead, readUpTo);
+                }
+            }
+
+            if (subtitle is null || subtitle.Paragraphs.Count == 0)
+            {
+                return new PartialSubtitles(null, state);
+            }
+
+            var text = GetWriter(outputFormat).ToText(subtitle, "untitled");
+            return new PartialSubtitles(new MemoryStream(Encoding.UTF8.GetBytes(text), false), state);
+        }
+
+        /// <summary>
+        /// Reads a .srt that ffmpeg may still be appending to; only the finished blocks count while it grows.
+        /// </summary>
+        /// <returns>The subtitle, or null when there is nothing yet.</returns>
+        private async Task<Subtitle?> ReadSrt(string path, bool complete, CancellationToken cancellationToken)
+        {
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
             string text;
-            var fileStream = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var fileStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             await using (fileStream.ConfigureAwait(false))
             {
                 using var reader = new StreamReader(fileStream, Encoding.UTF8, true);
@@ -200,12 +272,165 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
             if (string.IsNullOrWhiteSpace(text))
             {
-                return (null, complete);
+                return null;
             }
 
-            using var partial = new MemoryStream(Encoding.UTF8.GetBytes(text));
-            var info = new SubtitleInfo { Path = outputPath, Protocol = MediaProtocol.File, Format = "srt" };
-            return (ConvertSubtitles(partial, info, outputFormat, 0, 0, true), complete);
+            using var stream = new MemoryStream(Encoding.UTF8.GetBytes(text));
+            return _subtitleParser.Parse(stream, "srt");
+        }
+
+        /// <summary>
+        /// The lines read from the start, then the ones read from where the video jumped to (only past the first ones).
+        /// </summary>
+        internal static Subtitle? Merge(Subtitle? fromStart, Subtitle? ahead, long readUpTo)
+        {
+            if (ahead is null || ahead.Paragraphs.Count == 0)
+            {
+                return fromStart;
+            }
+
+            var merged = fromStart ?? new Subtitle();
+            merged.Paragraphs.AddRange(ahead.Paragraphs.Where(p => p.StartTime.TimeSpan.Ticks >= readUpTo));
+            merged.Paragraphs.Sort((a, b) => a.StartTime.TimeSpan.Ticks.CompareTo(b.StartTime.TimeSpan.Ticks));
+            merged.Renumber();
+            return merged;
+        }
+
+        private static string WindowKey(MediaSourceInfo mediaSource, int streamIndex)
+            => string.Create(CultureInfo.InvariantCulture, $"{ExtractionKey(mediaSource)}|{streamIndex}");
+
+        /// <summary>
+        /// The reading from where the video is, when it is past the part read from the start (the player jumped
+        /// ahead): like a streaming player, the subtitle is read from that point on, the first minutes at once.
+        /// A reading already covering that point is kept; one the reading from the start caught up with is stopped.
+        /// </summary>
+        private SeekWindow? SeekWindowFor(MediaSourceInfo mediaSource, MediaStream subtitleStream, string key, long readUpTo, long? positionTicks)
+        {
+            _seekWindows.TryGetValue(key, out var current);
+            if (current is not null && readUpTo >= current.StartTicks)
+            {
+                StopSeekWindow(key);
+                current = null;
+            }
+
+            if (positionTicks is not long position || position <= readUpTo + SeekWindowLead.Ticks)
+            {
+                return current;
+            }
+
+            if (current is not null && position >= current.StartTicks && position <= current.CoveredUpTo() + SeekWindowLead.Ticks)
+            {
+                return current;
+            }
+
+            StopSeekWindow(key);
+            return StartSeekWindow(mediaSource, subtitleStream, key, Math.Max(0, position - SeekWindowBack.Ticks));
+        }
+
+        private SeekWindow? StartSeekWindow(MediaSourceInfo mediaSource, MediaStream subtitleStream, string key, long fromTicks)
+        {
+            var path = GetSubtitleCachePath(mediaSource, subtitleStream.Index, ".ahead.srt");
+            var ffmpegIndex = EncodingHelper.GetSubtitleStreamIndexForFfmpeg(mediaSource, subtitleStream);
+            if (path is null || subtitleStream.IsExternal || ffmpegIndex == -1)
+            {
+                return null;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var args = string.Format(
+                CultureInfo.InvariantCulture,
+                "-y -ss {0:0.###} -copyts {1}-i {2} -map 0:{3} -an -vn -c:s srt -flush_packets 1 \"{4}\"",
+                TimeSpan.FromTicks(fromTicks).TotalSeconds,
+                ThrottleArguments(),
+                _mediaEncoder.GetInputPathArgument(mediaSource.Path, mediaSource),
+                ffmpegIndex,
+                path.EscapeProcessArgument());
+
+            var window = new SeekWindow(fromTicks, path, new CancellationTokenSource(), DateTime.UtcNow);
+            _seekWindows[key] = window;
+            _logger.LogInformation("Reading subtitles of {Path} from {Position} (the video jumped ahead)", mediaSource.Path, TimeSpan.FromTicks(fromTicks));
+            _ = Task.Run(
+                async () =>
+                {
+                    try
+                    {
+                        await RunSubtitleExtractionProcess(args, window.Cancel.Token, ThrottledDuration(mediaSource)).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Reading subtitles from {Position} failed for {Path}", TimeSpan.FromTicks(fromTicks), mediaSource.Path);
+                    }
+                    finally
+                    {
+                        // Stopped: its lines are no longer needed (the reading from the start has them)
+                        if (window.Cancel.IsCancellationRequested)
+                        {
+                            TryDelete(path);
+                            window.Cancel.Dispose();
+                        }
+                    }
+                },
+                CancellationToken.None);
+            return window;
+        }
+
+        private void StopSeekWindow(string key)
+        {
+            if (_seekWindows.TryRemove(key, out var window))
+            {
+                window.Cancel.Cancel();
+            }
+        }
+
+        /// <summary>The reading from the start of a file is over: the readings from further on are not needed.</summary>
+        private void StopSeekWindows(string extractionKey)
+        {
+            foreach (var key in _seekWindows.Keys.Where(k => k.StartsWith(extractionKey + "|", StringComparison.OrdinalIgnoreCase)))
+            {
+                StopSeekWindow(key);
+            }
+        }
+
+        private void TryDelete(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (IOException ex)
+            {
+                _logger.LogDebug(ex, "Could not delete {Path}", path);
+            }
+        }
+
+        /// <summary>
+        /// Where a subtitle that is not complete stands: being extracted, failed last time, or nobody started it
+        /// (then it starts now, so asking for it is enough to get it ready).
+        /// </summary>
+        private SubtitleExtractionState ExtractionStateOf(MediaSourceInfo mediaSource, bool retry)
+        {
+            if (IsExtracting(mediaSource))
+            {
+                return SubtitleExtractionState.Extracting;
+            }
+
+            if (!_serverConfigurationManager.GetEncodingOptions().EnableSubtitleExtraction)
+            {
+                return SubtitleExtractionState.NotNeeded;
+            }
+
+            var key = ExtractionKey(mediaSource);
+            if (retry)
+            {
+                _failedExtractions.TryRemove(key, out _);
+            }
+            else if (_failedExtractions.ContainsKey(key))
+            {
+                return SubtitleExtractionState.Failed;
+            }
+
+            _ = StartExtraction(mediaSource);
+            return SubtitleExtractionState.Extracting;
         }
 
         private async Task<(Stream Stream, SubtitleInfo Info)> GetSubtitleStream(
@@ -576,8 +801,95 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         }
 
         /// <inheritdoc />
-        public async Task ExtractAllExtractableSubtitles(MediaSourceInfo mediaSource, CancellationToken cancellationToken)
+        public Task ExtractAllExtractableSubtitles(MediaSourceInfo mediaSource, CancellationToken cancellationToken)
+            => StartExtraction(mediaSource).WaitAsync(cancellationToken);
+
+        /// <summary>The extraction of this file, the running one when there is one.</summary>
+        private Task StartExtraction(MediaSourceInfo mediaSource)
         {
+            var key = ExtractionKey(mediaSource);
+            lock (_extractionsLock)
+            {
+                if (!_runningExtractions.TryGetValue(key, out var running))
+                {
+                    running = RunExtraction(key, mediaSource);
+                    _runningExtractions[key] = running;
+                }
+
+                return running;
+            }
+        }
+
+        private async Task RunExtraction(string key, MediaSourceInfo mediaSource)
+        {
+            // Registered before it goes on (the lock is held by the caller until then)
+            await Task.Yield();
+            try
+            {
+                if (await ExtractAllExtractableSubtitlesCore(mediaSource).ConfigureAwait(false))
+                {
+                    _failedExtractions.TryRemove(key, out _);
+                }
+                else
+                {
+                    _failedExtractions[key] = DateTime.UtcNow;
+                }
+            }
+            finally
+            {
+                lock (_extractionsLock)
+                {
+                    _runningExtractions.Remove(key);
+                }
+
+                StopSeekWindows(key);
+            }
+        }
+
+        private static string ExtractionKey(MediaSourceInfo mediaSource) => mediaSource.Path ?? mediaSource.Id;
+
+        /// <summary>
+        /// The file is read at a moderate pace, like a player streaming it (ahead of what is watched, without a burst
+        /// on the disks): the first minutes at once, then a few times the playback speed.
+        /// </summary>
+        private string ThrottleArguments()
+        {
+            var version = _mediaEncoder.EncoderVersion;
+            if (version is null || version < _minFFmpegReadRate)
+            {
+                return string.Empty;
+            }
+
+            var burst = version >= _minFFmpegReadRateBurst
+                ? string.Create(CultureInfo.InvariantCulture, $"-readrate_initial_burst {ExtractionInitialBurstSeconds} ")
+                : string.Empty;
+            return string.Create(CultureInfo.InvariantCulture, $"-readrate {ExtractionReadRate} {burst}");
+        }
+
+        /// <summary>How long reading the whole file at that pace takes, with room to spare (zero when unknown).</summary>
+        private TimeSpan ThrottledDuration(MediaSourceInfo mediaSource)
+        {
+            if (mediaSource.RunTimeTicks is not > 0 || _mediaEncoder.EncoderVersion is null || _mediaEncoder.EncoderVersion < _minFFmpegReadRate)
+            {
+                return TimeSpan.Zero;
+            }
+
+            return TimeSpan.FromTicks(mediaSource.RunTimeTicks.Value / ExtractionReadRate * 3 / 2) + TimeSpan.FromMinutes(5);
+        }
+
+        private bool IsExtracting(MediaSourceInfo mediaSource)
+        {
+            lock (_extractionsLock)
+            {
+                return _runningExtractions.ContainsKey(ExtractionKey(mediaSource));
+            }
+        }
+
+        /// <summary>Reads the subtitles out of the file; nobody's request can cancel it (ffmpeg has its own time limit).</summary>
+        /// <returns>Whether it worked.</returns>
+        private async Task<bool> ExtractAllExtractableSubtitlesCore(MediaSourceInfo mediaSource)
+        {
+            var cancellationToken = CancellationToken.None;
             var locks = new List<IDisposable>();
             var extractableStreams = new List<MediaStream>();
 
@@ -618,10 +930,13 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     await ExtractAllExtractableSubtitlesInternal(mediaSource, extractableStreams, cancellationToken).ConfigureAwait(false);
                     await ExtractAllExtractableSubtitlesMKS(mediaSource, extractableStreams, cancellationToken).ConfigureAwait(false);
                 }
+
+                return true;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Unable to get streams for File:{File}", mediaSource.Path);
+                return false;
             }
             finally
             {
@@ -660,7 +975,8 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 var outputPaths = new List<string>();
                 var args = string.Format(
                     CultureInfo.InvariantCulture,
-                    "-y -i {0}",
+                    "-y {0}-i {1}",
+                    ThrottleArguments(),
                     inputPath);
 
                 foreach (var subtitleStream in subtitleStreams)
@@ -699,7 +1015,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                         outputPath.EscapeProcessArgument());
                 }
 
-                await ExtractSubtitlesForFile(inputPath, args, outputPaths, cancellationToken).ConfigureAwait(false);
+                await ExtractSubtitlesForFile(inputPath, args, outputPaths, cancellationToken, ThrottledDuration(mediaSource)).ConfigureAwait(false);
 
                 foreach (var outputPath in outputPaths)
                 {
@@ -717,7 +1033,8 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             var outputPaths = new List<string>();
             var args = string.Format(
                 CultureInfo.InvariantCulture,
-                "-y -i {0}",
+                "-y {0}-i {1}",
+                ThrottleArguments(),
                 inputPath);
 
             foreach (var subtitleStream in subtitleStreams)
@@ -759,7 +1076,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
             if (outputPaths.Count > 0)
             {
-                await ExtractSubtitlesForFile(inputPath, args, outputPaths, cancellationToken).ConfigureAwait(false);
+                await ExtractSubtitlesForFile(inputPath, args, outputPaths, cancellationToken, ThrottledDuration(mediaSource)).ConfigureAwait(false);
 
                 foreach (var outputPath in outputPaths)
                 {
@@ -772,9 +1089,10 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             string inputPath,
             string args,
             IReadOnlyList<string> outputPaths,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            TimeSpan minimumTimeout = default)
         {
-            var (exitCode, ffmpegError) = await RunSubtitleExtractionProcess(args, cancellationToken).ConfigureAwait(false);
+            var (exitCode, ffmpegError) = await RunSubtitleExtractionProcess(args, cancellationToken, minimumTimeout).ConfigureAwait(false);
 
             var failed = false;
 
@@ -925,8 +1243,9 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         /// </remarks>
         /// <param name="arguments">The ffmpeg command line arguments.</param>
         /// <param name="cancellationToken">The cancellation token.</param>
+        /// <param name="minimumTimeout">Time allowed at least, beyond the configured limit (a file read at a moderate pace).</param>
         /// <returns>The ffmpeg exit code (-1 on timeout) and its captured stderr output.</returns>
-        private async Task<(int ExitCode, string StandardError)> RunSubtitleExtractionProcess(string arguments, CancellationToken cancellationToken)
+        private async Task<(int ExitCode, string StandardError)> RunSubtitleExtractionProcess(string arguments, CancellationToken cancellationToken, TimeSpan minimumTimeout = default)
         {
             int exitCode;
             var standardError = string.Empty;
@@ -966,7 +1285,9 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 var standardErrorTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
                 var timeoutMinutes = _serverConfigurationManager.GetEncodingOptions().SubtitleExtractionTimeoutMinutes;
                 using var waitSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                waitSource.CancelAfter(TimeSpan.FromMinutes(timeoutMinutes));
+                // A file read at a moderate pace takes longer than the configured limit allows for long videos
+                var timeout = TimeSpan.FromMinutes(timeoutMinutes);
+                waitSource.CancelAfter(minimumTimeout > timeout ? minimumTimeout : timeout);
 
                 try
                 {
@@ -1117,6 +1438,19 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             public string Format { get; init; }
 
             public bool IsExternal { get; init; }
+        }
+
+        /// <summary>A reading of one subtitle from where the video jumped to.</summary>
+        /// <param name="StartTicks">Where it starts in the video.</param>
+        /// <param name="Path">The file it writes.</param>
+        /// <param name="Cancel">Stops it.</param>
+        /// <param name="StartedAt">When it started.</param>
+        private sealed record SeekWindow(long StartTicks, string Path, CancellationTokenSource Cancel, DateTime StartedAt)
+        {
+            /// <summary>How far in the video it has read by now (the first minutes at once, then at its pace).</summary>
+            /// <returns>The position, in ticks.</returns>
+            public long CoveredUpTo()
+                => StartTicks + TimeSpan.FromSeconds(ExtractionInitialBurstSeconds).Ticks + ((DateTime.UtcNow - StartedAt).Ticks * ExtractionReadRate);
         }
     }
 }

@@ -21,6 +21,9 @@ public class SubtitleProgressController : BaseJellyfinApiController
     /// <summary>Header that says the extraction has finished (the regular subtitle request returns everything).</summary>
     public const string CompleteHeader = "X-Subtitles-Complete";
 
+    /// <summary>Header with where the extraction stands: none, extracting, complete or failed.</summary>
+    public const string StateHeader = "X-Subtitles-State";
+
     private readonly ILibraryManager _libraryManager;
     private readonly ISubtitleEncoder _subtitleEncoder;
 
@@ -41,18 +44,26 @@ public class SubtitleProgressController : BaseJellyfinApiController
     /// <param name="itemId">The item id.</param>
     /// <param name="mediaSourceId">The media source id.</param>
     /// <param name="index">The subtitle stream index.</param>
+    /// <param name="retry">Try again an extraction that failed.</param>
+    /// <param name="positionTicks">Where the video is (after a jump ahead, the subtitle is also read from there).</param>
     /// <response code="200">The subtitle so far.</response>
-    /// <response code="204">Nothing extracted yet.</response>
+    /// <response code="204">Nothing to show yet (or nothing to extract).</response>
     /// <response code="404">Item not found.</response>
-    /// <returns>The subtitle so far, with a header saying whether the extraction is complete.</returns>
-    [HttpGet("{itemId}/{mediaSourceId}/Subtitles/{index}/Partial.js")]
+    /// <returns>The subtitle so far, with headers saying where the extraction stands. It never waits for it.</returns>
+    /// <remarks>
+    /// No file extension in the route: reverse proxies that cache static assets by extension (".js" among them,
+    /// ignoring Cache-Control) would otherwise keep answering an old, unfinished subtitle.
+    /// </remarks>
+    [HttpGet("{itemId}/{mediaSourceId}/Subtitles/{index}/Partial")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult> GetPartialSubtitles(
         [FromRoute, Required] Guid itemId,
         [FromRoute, Required] string mediaSourceId,
-        [FromRoute, Required] int index)
+        [FromRoute, Required] int index,
+        [FromQuery] bool retry = false,
+        [FromQuery] long? positionTicks = null)
     {
         var item = _libraryManager.GetItemById(itemId);
         if (item is null)
@@ -60,17 +71,25 @@ public class SubtitleProgressController : BaseJellyfinApiController
             return NotFound();
         }
 
-        var (content, complete) = await _subtitleEncoder
-            .GetPartialSubtitles(item, mediaSourceId, index, "json", HttpContext.RequestAborted)
+        var partial = await _subtitleEncoder
+            .GetPartialSubtitles(item, mediaSourceId, index, "json", retry, positionTicks, HttpContext.RequestAborted)
             .ConfigureAwait(false);
 
-        Response.Headers[CompleteHeader] = complete ? "true" : "false";
+        // "Complete" also when there is nothing to extract: the regular request answers at once
+        Response.Headers[CompleteHeader] = partial.State is SubtitleExtractionState.Complete or SubtitleExtractionState.NotNeeded ? "true" : "false";
+        Response.Headers[StateHeader] = partial.State switch
+        {
+            SubtitleExtractionState.Extracting => "extracting",
+            SubtitleExtractionState.Complete => "complete",
+            SubtitleExtractionState.Failed => "failed",
+            _ => "none"
+        };
         Response.Headers.CacheControl = "no-store";
-        if (content is null)
+        if (partial.Content is null)
         {
             return NoContent();
         }
 
-        return File(content, "application/json");
+        return File(partial.Content, "application/json");
     }
 }

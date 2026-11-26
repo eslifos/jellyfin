@@ -649,6 +649,7 @@ namespace Emby.Server.Implementations
             serviceCollection.AddSingleton<MediaBrowser.Controller.MusicHub.IMusicHubService, Emby.Server.Implementations.MusicHub.MusicHubService>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.MusicHub.IMusicLyricsService, Emby.Server.Implementations.MusicHub.MusicLyricsService>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.MusicHub.IMusicMetadataService, Emby.Server.Implementations.MusicHub.MusicMetadataService>();
+            serviceCollection.AddSingleton<MediaBrowser.Controller.Library.IGenreNormalizer, Emby.Server.Implementations.Library.Genres.GenreNormalizer>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.Imdb.IImdbRatingsService, Emby.Server.Implementations.Imdb.ImdbRatingsService>();
             serviceCollection.AddSingleton<MediaBrowser.Controller.Discovery.IDiscoveryService, Emby.Server.Implementations.Discovery.DiscoveryService>();
         serviceCollection.AddSingleton<MediaBrowser.Controller.Home.IHomeSnapshotService, Emby.Server.Implementations.Home.HomeSnapshotService>();
