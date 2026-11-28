@@ -12,6 +12,11 @@ public record SwitchProfileDto
     /// Gets the password of the account (master user). Required when switching away from a secondary profile.
     /// </summary>
     public string? Password { get; init; }
+
+    /// <summary>
+    /// Gets the PIN of the account, which also lets a secondary profile (a kids profile) be left.
+    /// </summary>
+    public string? Pin { get; init; }
 }
 
 /// <summary>
@@ -48,6 +53,16 @@ public record ProfileDto
     /// Gets a value indicating whether the profile is disabled.
     /// </summary>
     public bool IsDisabled { get; init; }
+
+    /// <summary>
+    /// Gets a value indicating whether this is a kids profile (only the libraries chosen for it).
+    /// </summary>
+    public bool IsKids { get; init; }
+
+    /// <summary>
+    /// Gets the libraries a kids profile sees (none for other profiles).
+    /// </summary>
+    public IReadOnlyList<Guid> KidsLibraryIds { get; init; } = Array.Empty<Guid>();
 }
 
 /// <summary>
@@ -69,6 +84,11 @@ public record ProfileListDto
     /// Gets a value indicating whether the caller can create and delete profiles.
     /// </summary>
     public bool CanManage { get; init; }
+
+    /// <summary>
+    /// Gets a value indicating whether the account has a PIN to leave its secondary profiles.
+    /// </summary>
+    public bool HasPin { get; init; }
 
     /// <summary>
     /// Gets the profiles, master first.
@@ -101,4 +121,31 @@ public record CreateProfileDto
     /// Gets the profile name.
     /// </summary>
     public required string Name { get; init; }
+}
+
+/// <summary>
+/// Request to make a profile a kids profile (only some libraries) or a normal one again.
+/// </summary>
+public record KidsProfileDto
+{
+    /// <summary>
+    /// Gets a value indicating whether the profile is a kids profile.
+    /// </summary>
+    public bool IsKids { get; init; }
+
+    /// <summary>
+    /// Gets the libraries a kids profile sees (at least one when <see cref="IsKids"/> is set).
+    /// </summary>
+    public IReadOnlyList<Guid>? LibraryIds { get; init; }
+}
+
+/// <summary>
+/// Request to set (or, empty, remove) the PIN of an account.
+/// </summary>
+public record ProfilePinDto
+{
+    /// <summary>
+    /// Gets the new PIN: 4 to 8 digits, or empty to remove it.
+    /// </summary>
+    public string? Pin { get; init; }
 }
